@@ -26,3 +26,4 @@ Press `i` for the item's path, what it is, why it is safe or risky to remove, an
 - Press `r` to rescan now and `i` for item details.
 - Claude CLI: `rm-rf` uses your signed-in `claude` CLI for automatic reviews during a new scan, or when you press `a` on the focused item. `i` only shows saved details and the latest Claude verdict; it does not make a Claude request.
 - Scan locations, labels, and cleanup reasons live in [`config/cleanup-targets.json`](config/cleanup-targets.json). Review changes to this file carefully: it controls what rm-rf can scan and delete.
+- English is the default UI language. Use `--lang ko` for Korean. Item identity and safety messages are managed in [`config/locales/`](config/locales/).

@@ -21,8 +21,8 @@ import shutil
 import stat
 import subprocess
 import sys
-import textwrap
 import time
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -30,7 +30,7 @@ from typing import Callable, Iterable, Optional
 
 
 APP_NAME = "rm-rf"
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 MIB = 1024 * 1024
 GIB = 1024 * MIB
 DEFAULT_MIN_BYTES = 50 * MIB
@@ -38,6 +38,92 @@ AI_MIN_BYTES = 250 * MIB
 DEFAULT_CACHE_TTL_HOURS = 24
 SECONDS_PER_HOUR = 60 * 60
 TARGET_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "cleanup-targets.json"
+LOCALES_DIR = Path(__file__).resolve().parent / "config" / "locales"
+DEFAULT_LANGUAGE = "en"
+ACTIVE_LANGUAGE = DEFAULT_LANGUAGE
+MESSAGES: dict = {}
+
+
+def configure_language(language: str) -> None:
+    """Load the requested CLI language from the versioned locale catalog."""
+
+    global ACTIVE_LANGUAGE, MESSAGES
+    locale_path = LOCALES_DIR / f"{language}.json"
+    try:
+        with locale_path.open(encoding="utf-8") as handle:
+            messages = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Cannot load language '{language}' from {locale_path}: {error}") from error
+    if (
+        not isinstance(messages, dict)
+        or messages.get("version") != 1
+        or messages.get("language") != language
+        or not isinstance(messages.get("identity"), dict)
+        or not isinstance(messages.get("safety"), dict)
+        or not isinstance(messages.get("ui"), dict)
+    ):
+        raise RuntimeError(f"Invalid language catalog: {locale_path}")
+    ACTIVE_LANGUAGE = language
+    MESSAGES = messages
+
+
+def t(key: str, **values: object) -> str:
+    """Return a localized message; catalogs are data, never executable code."""
+
+    value: object = MESSAGES
+    for part in key.split("."):
+        if not isinstance(value, dict) or part not in value:
+            raise RuntimeError(f"Missing translation key '{key}' for language '{ACTIVE_LANGUAGE}'")
+        value = value[part]
+    if not isinstance(value, str):
+        raise RuntimeError(f"Translation key '{key}' is not a string")
+    try:
+        return value.format(**values)
+    except (KeyError, ValueError) as error:
+        raise RuntimeError(f"Cannot format translation key '{key}': {error}") from error
+
+
+def display_width(text: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1 for char in text)
+
+
+def pad_display(text: str, width: int) -> str:
+    """Pad terminal text by display cells so CJK labels keep columns aligned."""
+
+    return text + " " * max(0, width - display_width(text))
+
+
+def wrap_display(text: str, width: int) -> list[str]:
+    """Wrap Unicode text by terminal cells, including wide Korean characters."""
+
+    lines: list[str] = []
+    for paragraph in text.splitlines() or [""]:
+        remaining = paragraph
+        while display_width(remaining) > width:
+            used = 0
+            split_at = 0
+            last_space = 0
+            for index, character in enumerate(remaining, 1):
+                char_width = display_width(character)
+                if used + char_width > width:
+                    break
+                used += char_width
+                split_at = index
+                if character.isspace():
+                    last_space = index
+            if split_at == 0:
+                break
+            if last_space and last_space >= split_at // 2:
+                lines.append(remaining[:last_space].rstrip())
+                remaining = remaining[last_space:].lstrip()
+            else:
+                lines.append(remaining[:split_at])
+                remaining = remaining[split_at:]
+        lines.append(remaining)
+    return lines
+
+
+configure_language(DEFAULT_LANGUAGE)
 
 
 @dataclass(frozen=True)
@@ -75,10 +161,11 @@ class Candidate:
     recommendation: str = "review"  # delete, review, keep
     ai_reason: str = ""
     ai_confidence: Optional[float] = None
+    ai_language: str = ""
 
     @classmethod
     def from_dict(cls, value: dict) -> "Candidate":
-        fields = {name: value.get(name) for name in cls.__dataclass_fields__}
+        fields = {name: value[name] for name in cls.__dataclass_fields__ if name in value}
         return cls(**fields)
 
 
@@ -132,10 +219,10 @@ def human_bytes(value: int) -> str:
 
 def human_time(timestamp: float) -> str:
     if not timestamp:
-        return "unknown"
+        return t("ui.unknown")
     delta = max(0, time.time() - timestamp)
     if delta < 86400:
-        return "today"
+        return t("ui.today")
     if delta < 86400 * 60:
         return f"{int(delta // 86400)} days ago"
     return dt.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
@@ -146,43 +233,40 @@ def item_identity(item: Candidate) -> str:
 
     path = item.path.lower()
     if "ms-playwright" in path or "playwright" in path:
-        return (
-            "Playwright browser binaries cached for web automation tests. They include Chromium, Firefox, or WebKit "
-            "and may be created by a Node/Python project, test tool, or development dependency you did not install directly."
-        )
+        return t("identity.playwright")
     if "deriveddata" in path:
-        return "Xcode build intermediates and indexes. This is not your source code or the application itself."
+        return t("identity.xcode_derived_data")
     if "coresimulator" in path or "simulator" in item.label.lower():
-        return "Caches created by the Xcode iOS Simulator. They are regenerated when the simulator or app runs again."
+        return t("identity.xcode_simulator")
     if "crashreport" in path or "diagnosticreport" in path:
-        return "Diagnostic reports for investigating application crashes, not application data or personal documents."
+        return t("identity.crash_report")
     if ".gradle" in path:
-        return "Plugins and dependencies cached by Gradle. A later build may download them again."
+        return t("identity.gradle")
     if ".m2" in path or "maven" in item.label.lower():
-        return "Libraries downloaded by Java/Maven projects. This is not project source, but the next build may take longer."
+        return t("identity.maven")
     if "npm" in path or "pnpm" in path or "yarn" in path:
-        return "Packages and archives cached by a JavaScript package manager. They are downloaded again during a later install."
+        return t("identity.javascript")
     if "pip" in path or "python" in path and "cache" in path:
-        return "Download and build caches created while installing Python packages. They may be regenerated during a later install."
+        return t("identity.python")
     if item.safety == "trash":
-        return "Files already in Trash. They are no longer in their original locations, but cannot be restored from Finder after removal."
+        return t("identity.trash")
     if item.safety == "rotated_log":
-        return "Older diagnostic logs and crash reports, not currently active logs."
+        return t("identity.rotated_log")
     if item.safety == "cache":
-        return "A recreatable cache stored by an app or development tool to make future work faster."
-    return "This may be user data or costly to restore. Check the path and purpose before deleting it."
+        return t("identity.cache")
+    return t("identity.fallback")
 
 
 def safety_summary(item: Candidate) -> str:
     if "ms-playwright" in item.path.lower() or "playwright" in item.path.lower():
-        return "Usually safe to remove. Playwright will download roughly 1 GB of browsers again when tests need them."
+        return t("safety.playwright")
     if item.safety == "cache":
-        return "Usually safe to remove. It is not original data, but the next launch or build may be slower and require downloads."
+        return t("safety.cache")
     if item.safety == "trash":
-        return "High confidence, but permanent. Removing it here also prevents recovery from Trash."
+        return t("safety.trash")
     if item.safety == "rotated_log":
-        return "Usually safe to remove, unless you are investigating a problem and need the diagnostic logs."
-    return "Use caution. This may be a user backup or downloaded dependency, so check its purpose and restoration cost."
+        return t("safety.rotated_log")
+    return t("safety.fallback")
 
 
 def path_is_within(child: Path, parent: Path) -> bool:
@@ -584,6 +668,7 @@ label: {item.label}
 category: {item.group}; baseline safety: {item.safety}
 size: {human_bytes(item.bytes)}; last modified: {human_time(item.modified_at)}
 known description: {item.reason}
+Write the reason in {t('meta.name')}.
 """
     try:
         result = subprocess.run(
@@ -668,6 +753,7 @@ def assess_with_claude(
             item.recommendation = recommendation
             item.ai_reason = f"Claude: {reason}"
             item.ai_confidence = confidence
+            item.ai_language = ACTIVE_LANGUAGE
             item.priority = calculate_priority(item)
             console.good(f"Claude: {recommendation} ({confidence if confidence is not None else 'n/a'})")
             reviewed += 1
@@ -881,7 +967,7 @@ class RmRfTui:
         self.items: list[Candidate] = []
         self.selected: set[str] = set()
         self.cursor = 0
-        self.status = "Preparing a very responsible `rm -rf` experience."
+        self.status = t("ui.preparing")
         self.scanning = False
         self.work_as_overlay = False
         self.scanned_at: Optional[float] = None
@@ -962,7 +1048,7 @@ class RmRfTui:
         self.box(y, x, panel_height, panel_width, APP_NAME)
         self.add(y + 2, x + 3, heading, self.attr("title"), panel_width - 6)
         self.add(y + 4, x + 3, text, self.attr("text"), panel_width - 6)
-        self.add(y + 6, x + 3, "Your files are safe; only known cleanup locations are being checked.", self.attr("dim"), panel_width - 6)
+        self.add(y + 6, x + 3, t("ui.safe_scope_notice"), self.attr("dim"), panel_width - 6)
         self.screen.refresh()
 
     def work_overlay(self, heading: str, text: str) -> None:
@@ -983,12 +1069,12 @@ class RmRfTui:
         self.add(y + panel_height - 1, x, "╰" + horizontal + "╯", self.attr("modal_title"), panel_width)
         self.add(y, x + 2, f" {heading} ", self.attr("modal_title"), panel_width - 4)
         self.add(y + 2, x + 3, text, self.attr("modal"), panel_width - 6)
-        self.add(y + 4, x + 3, "The list remains behind this panel. rm-rf is thinking politely.", self.attr("modal"), panel_width - 6)
+        self.add(y + 4, x + 3, t("ui.overlay_notice"), self.attr("modal"), panel_width - 6)
         self.screen.refresh()
 
     def scan_notice(self, level: str, text: str) -> None:
         self.status = text
-        heading = "Asking Claude politely…" if "Claude" in text or "AI review" in text or "metadata" in text else "Looking for digital lint…"
+        heading = t("ui.asking_claude") if self.work_as_overlay else t("ui.scanning_heading")
         if self.work_as_overlay:
             self.work_overlay(heading, text)
         else:
@@ -1009,14 +1095,14 @@ class RmRfTui:
         return [item for item in self.items if item.id in self.selected]
 
     def draw_detail(self, y: int, x: int, height: int, width: int, item: Candidate) -> None:
-        self.box(y, x, height, width, "Selected candidate")
+        self.box(y, x, height, width, t("ui.selected_candidate"))
         self.add(y + 1, x + 2, item.label, self.attr("accent"), width - 4)
         fields = [
-            f"{human_bytes(item.bytes)}  •  priority {item.priority}/100",
+            f"{human_bytes(item.bytes)}  •  {t('ui.priority')} {item.priority}/100",
             f"{item.recommendation.upper()}  •  {item.group}",
             item.path,
             item.ai_reason or item.reason,
-            f"Changed {human_time(item.modified_at)}",
+            f"{t('ui.changed')} {human_time(item.modified_at)}",
         ]
         row = y + 3
         for field in fields:
@@ -1029,13 +1115,13 @@ class RmRfTui:
         self.screen.erase()
         height, width = self.screen.getmaxyx()
         if height < 18 or width < 72:
-            self.add(2, 2, "rm-rf needs a terminal at least 72 columns × 18 rows.", self.attr("warn"))
-            self.add(4, 2, "Resize the terminal, then press any key.", self.attr("text"))
+            self.add(2, 2, t("ui.small_terminal"), self.attr("warn"))
+            self.add(4, 2, t("ui.resize_terminal"), self.attr("text"))
             self.screen.refresh()
             return
 
         self.add(1, 3, "rm-rf", self.attr("title"))
-        self.add(1, 10, "the disk cleaner with a name your sysadmin would side-eye", self.attr("dim"), width - 13)
+        self.add(1, 10, t("ui.tagline"), self.attr("dim"), width - 13)
         self.add(2, 3, self.status, self.attr("text"), width - 6)
 
         usage = shutil.disk_usage(self.home)
@@ -1044,17 +1130,17 @@ class RmRfTui:
         recommended = sum(item.bytes for item in self.items if item.recommendation == "delete")
         gap = 2
         card_width = max(20, (width - 8 - gap * 2) // 3)
-        self.card(4, 3, card_width, "SPACE AVAILABLE", human_bytes(usage.free), f"of {human_bytes(usage.total)} on this volume", "good")
-        self.card(4, 3 + card_width + gap, card_width, "RECOMMENDED RECLAIM", human_bytes(recommended), "high-confidence items only", "accent")
-        self.card(4, 3 + (card_width + gap) * 2, card_width, "YOUR SELECTION", human_bytes(selected_bytes), f"{len(selected)} item(s) ready to review", "warn" if selected else "text")
+        self.card(4, 3, card_width, t("ui.space_available"), human_bytes(usage.free), t("ui.of_volume", total=human_bytes(usage.total)), "good")
+        self.card(4, 3 + card_width + gap, card_width, t("ui.recommended_reclaim"), human_bytes(recommended), t("ui.high_confidence_only"), "accent")
+        self.card(4, 3 + (card_width + gap) * 2, card_width, t("ui.your_selection"), human_bytes(selected_bytes), t("ui.items_ready", count=len(selected)), "warn" if selected else "text")
 
         list_y = 10
         footer_y = height - 3
         wide = width >= 118
         list_width = int((width - 8) * 0.62) if wide else width - 6
         list_height = max(5, footer_y - list_y)
-        self.box(list_y, 3, list_height, list_width, f"Cleanup candidates · {len(self.items)} found")
-        self.add(list_y + 1, 5, "   STATE          PRIORITY     SIZE     RECOMMENDATION     ITEM", self.attr("dim"), list_width - 4)
+        self.box(list_y, 3, list_height, list_width, t("ui.cleanup_candidates", count=len(self.items)))
+        self.add(list_y + 1, 5, t("ui.table_header"), self.attr("dim"), list_width - 4)
         visible = max(1, list_height - 3)
         start = max(0, min(self.cursor - visible // 2, max(0, len(self.items) - visible)))
         for row, item in enumerate(self.items[start : start + visible], list_y + 2):
@@ -1062,7 +1148,7 @@ class RmRfTui:
             marked = item.id in self.selected
             # Keep this field fixed-width so selecting a row never shifts its
             # priority, size, recommendation, or label columns.
-            checked = f"{'[✓ SELECTED]' if marked else '[ ]':<13}"
+            checked = pad_display(t("ui.selected") if marked else "[ ]", 13)
             marker = "›" if index == self.cursor else " "
             rec = item.recommendation.upper()
             line = f"{marker}{checked}  {item.priority:>3}/100  {human_bytes(item.bytes):>9}  {rec:<14} {item.label}"
@@ -1076,17 +1162,16 @@ class RmRfTui:
                 style = self.attr("text")
             self.add(row, 5, line, style, list_width - 4)
         if not self.items:
-            self.add(list_y + 3, 5, "Nothing above the current minimum size. Your disk is suspiciously well behaved.", self.attr("dim"), list_width - 4)
+            self.add(list_y + 3, 5, t("ui.nothing_found"), self.attr("dim"), list_width - 4)
 
         active = self.active_item()
         if wide and active:
             detail_x = 3 + list_width + 2
             self.draw_detail(list_y, detail_x, list_height, width - detail_x - 3, active)
         elif active:
-            self.add(footer_y - 1, 3, f"{active.path}  •  press i for details", self.attr("dim"), width - 6)
+            self.add(footer_y - 1, 3, f"{active.path}  •  {t('ui.details_hint')}", self.attr("dim"), width - 6)
 
-        footer = "↑↓ move   Space select/unselect   green [✓ SELECTED] = deletion set   Enter delete   i details   a review focused item   r rescan   q quit"
-        self.add(height - 2, 3, footer, self.attr("dim"), width - 6)
+        self.add(height - 2, 3, t("ui.footer"), self.attr("dim"), width - 6)
         self.screen.refresh()
 
     def read_text(self, title: str, lines: list[str], prompt: str) -> str:
@@ -1095,9 +1180,7 @@ class RmRfTui:
         content_width = max(16, panel_width - 6)
         wrapped_lines: list[str] = []
         for line in lines:
-            wrapped_lines.extend(
-                textwrap.wrap(line, width=content_width, break_long_words=True, break_on_hyphens=False) or [""]
-            )
+            wrapped_lines.extend(wrap_display(line, content_width))
         maximum_body_rows = max(1, height - 9)
         if len(wrapped_lines) > maximum_body_rows:
             wrapped_lines = wrapped_lines[:maximum_body_rows]
@@ -1121,7 +1204,7 @@ class RmRfTui:
             self.add(y + 2 + index, x + 3, line, self.attr("modal"), panel_width - 6)
         input_y = y + panel_height - 3
         if not prompt:
-            self.add(input_y, x + 3, "Press any key to return.", self.attr("modal"), panel_width - 6)
+            self.add(input_y, x + 3, t("ui.press_any_key"), self.attr("modal"), panel_width - 6)
             self.screen.refresh()
             self.screen.getch()
             return ""
@@ -1151,14 +1234,14 @@ class RmRfTui:
             return
         lines = [
             item.label,
-            f"Path: {item.path}",
-            f"What: {item_identity(item)}",
-            f"Safety: {safety_summary(item)}",
-            f"Size: {human_bytes(item.bytes)} · priority: {item.priority}/100 · changed: {human_time(item.modified_at)}",
-            f"Recommendation: {item.recommendation.upper()}",
-            f"Cleanup rationale: {item.ai_reason or item.reason}",
+            f"{t('ui.path')}: {item.path}",
+            f"{t('ui.what')}: {item_identity(item)}",
+            f"{t('ui.safety')}: {safety_summary(item)}",
+            f"{t('ui.size')}: {human_bytes(item.bytes)} · {t('ui.priority')}: {item.priority}/100 · {t('ui.changed').lower()}: {human_time(item.modified_at)}",
+            f"{t('ui.recommendation')}: {item.recommendation.upper()}",
+            f"{t('ui.cleanup_rationale')}: {item.ai_reason or item.reason}",
         ]
-        self.read_text("Candidate details", lines, "")
+        self.read_text(t("ui.candidate_details"), lines, "")
 
     def run_work(self, message: str, operation: Callable[[], None], overlay: bool = False) -> None:
         prior_handler = console.handler
@@ -1178,7 +1261,7 @@ class RmRfTui:
         def operation() -> None:
             self.items = scan_and_save(self.home, self.cache_dir, self.min_bytes, self.use_ai)
 
-        self.run_work("Scanning bounded cleanup locations…", operation)
+        self.run_work(t("ui.scanning"), operation)
         data = load_cache(self.cache_dir)
         self.scanned_at = data.get("scanned_at") if data else time.time()
         self.selected.clear()
@@ -1186,20 +1269,20 @@ class RmRfTui:
         reviewed = sum(1 for item in self.items if item.ai_reason.startswith("Claude:"))
         unavailable = [item.ai_reason.removeprefix("Claude unavailable: ") for item in self.items if item.ai_reason.startswith("Claude unavailable:")]
         if reviewed:
-            self.status = f"Fresh scan complete. Claude reviewed {reviewed} uncertain large item(s); reasons are in the detail panel."
+            self.status = t("ui.fresh_scan_claude", count=reviewed)
         elif unavailable:
             self.status = unavailable[-1]
             self.read_text(
-                "Claude sign-in required",
+                t("ui.claude_sign_in"),
                 [
                     self.status,
-                    "Run `claude auth login` in a terminal and complete sign-in.",
-                    "Then return here and press r to rerun the scan and automatic review.",
+                    t("ui.sign_in_instruction"),
+                    t("ui.sign_in_rescan"),
                 ],
                 "",
             )
         else:
-            self.status = f"Fresh scan complete. {len(self.items)} candidates are ready for a second opinion."
+            self.status = t("ui.fresh_scan", count=len(self.items))
 
     def review_with_claude(self) -> None:
         focused = self.active_item()
@@ -1214,32 +1297,32 @@ class RmRfTui:
             outcome["problems"] = problems
             write_cache(self.cache_dir, self.home, self.min_bytes, self.items, scanned_at=self.scanned_at)
 
-        self.run_work("Claude is considering the focused item…", operation, overlay=True)
+        self.run_work(t("ui.claude_reviewing"), operation, overlay=True)
         if outcome["reviewed"]:
             self.cursor = next((index for index, item in enumerate(self.items) if item.id == focused.id), self.cursor)
-            confidence = f"{focused.ai_confidence:.0%}" if focused.ai_confidence is not None else "not supplied"
-            self.status = "Claude's verdict was saved to this item."
+            confidence = f"{focused.ai_confidence:.0%}" if focused.ai_confidence is not None else t("ui.not_supplied")
+            self.status = t("ui.verdict_saved")
             self.read_text(
-                "Claude's verdict",
+                t("ui.claude_verdict"),
                 [
                     focused.label,
-                    f"What: {item_identity(focused)}",
-                    f"Safety: {safety_summary(focused)}",
-                    f"Recommendation: {focused.recommendation.upper()}  ·  confidence: {confidence}",
-                    f"Claude rationale: {focused.ai_reason.removeprefix('Claude: ')}",
-                    "Saved to this item and reflected in its priority. Press any key to continue.",
+                    f"{t('ui.what')}: {item_identity(focused)}",
+                    f"{t('ui.safety')}: {safety_summary(focused)}",
+                    f"{t('ui.recommendation')}: {focused.recommendation.upper()}  ·  {t('ui.confidence')}: {confidence}",
+                    f"{t('ui.claude_rationale')}: {focused.ai_reason.removeprefix('Claude: ')}",
+                    t("ui.saved_verdict"),
                 ],
                 "",
             )
         else:
             problems = outcome["problems"]
-            self.status = problems[-1] if problems else "Claude found nothing eligible to review."
+            self.status = problems[-1] if problems else t("ui.claude_nothing")
             self.read_text(
-                "Claude review needs attention",
+                t("ui.claude_attention"),
                 [
                     self.status,
-                    "To restore Claude review, run `claude auth login` in a terminal.",
-                    "After signing in, press r for automatic review or a for this item again.",
+                    t("ui.sign_in_instruction"),
+                    t("ui.sign_in_retry"),
                 ],
                 "",
             )
@@ -1288,12 +1371,13 @@ class RmRfTui:
             self.items = items
             self.scanned_at = data.get("scanned_at")
             stamp = dt.datetime.fromtimestamp(self.scanned_at).strftime("%Y-%m-%d %H:%M") if self.scanned_at else "earlier"
-            self.status = f"Cached scan from {stamp} (age {short_duration(cache_age_seconds(data))})."
+            self.status = t("ui.cached_scan", timestamp=stamp, age=short_duration(cache_age_seconds(data)))
         else:
             if data and data.get("home") == str(self.home):
-                self.status = (
-                    f"Cache expired after {short_duration(cache_age_seconds(data))} "
-                    f"(limit {short_duration(self.cache_ttl_seconds)}); rescanning now."
+                self.status = t(
+                    "ui.cache_expired",
+                    age=short_duration(cache_age_seconds(data)),
+                    limit=short_duration(self.cache_ttl_seconds),
                 )
             self.refresh_scan()
 
@@ -1349,6 +1433,7 @@ def parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     argument_parser.add_argument("command", nargs="?", choices=("interactive", "scan", "list"), default="interactive")
+    argument_parser.add_argument("--lang", choices=("en", "ko"), default=DEFAULT_LANGUAGE, help="Display language")
     ai_options = argument_parser.add_mutually_exclusive_group()
     ai_options.add_argument("--ai", dest="ai", action="store_true", default=True, help="Enable automatic Claude review (this is the default)")
     ai_options.add_argument("--no-ai", dest="ai", action="store_false", default=argparse.SUPPRESS, help="Skip Claude review and keep uncertain items as REVIEW")
@@ -1367,6 +1452,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = parser().parse_args()
+    configure_language(args.lang)
     if args.min_size < 0:
         parser().error("--min-size must be zero or greater")
     if args.cache_ttl_hours < 0:
