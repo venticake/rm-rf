@@ -37,6 +37,7 @@ DEFAULT_MIN_BYTES = 50 * MIB
 AI_MIN_BYTES = 250 * MIB
 DEFAULT_CACHE_TTL_HOURS = 24
 SECONDS_PER_HOUR = 60 * 60
+TARGET_CONFIG_PATH = Path(__file__).resolve().parent / "config" / "cleanup-targets.json"
 
 
 @dataclass(frozen=True)
@@ -146,43 +147,42 @@ def item_identity(item: Candidate) -> str:
     path = item.path.lower()
     if "ms-playwright" in path or "playwright" in path:
         return (
-            "웹 자동화 테스트용 Playwright 브라우저 바이너리 캐시입니다. Chromium·Firefox·WebKit을 "
-            "테스트 실행용으로 내려받아 둔 것이며, Node/Python 프로젝트·테스트 도구·개발 의존성이 "
-            "직접 설치하지 않아도 만들 수 있습니다."
+            "Playwright browser binaries cached for web automation tests. They include Chromium, Firefox, or WebKit "
+            "and may be created by a Node/Python project, test tool, or development dependency you did not install directly."
         )
     if "deriveddata" in path:
-        return "Xcode가 프로젝트를 빌드하면서 만든 중간 산출물·인덱스입니다. 원본 소스나 앱 자체는 아닙니다."
+        return "Xcode build intermediates and indexes. This is not your source code or the application itself."
     if "coresimulator" in path or "simulator" in item.label.lower():
-        return "Xcode iOS Simulator가 앱을 실행하며 만든 캐시입니다. Simulator 또는 앱을 다시 열면 재생성됩니다."
+        return "Caches created by the Xcode iOS Simulator. They are regenerated when the simulator or app runs again."
     if "crashreport" in path or "diagnosticreport" in path:
-        return "앱 충돌을 분석하기 위한 진단 보고서입니다. 앱 실행 데이터나 개인 문서 자체는 아닙니다."
+        return "Diagnostic reports for investigating application crashes, not application data or personal documents."
     if ".gradle" in path:
-        return "Gradle 빌드 도구가 내려받은 플러그인·의존성 캐시입니다. 다음 빌드에서 다시 다운로드될 수 있습니다."
+        return "Plugins and dependencies cached by Gradle. A later build may download them again."
     if ".m2" in path or "maven" in item.label.lower():
-        return "Java/Maven 프로젝트가 내려받은 라이브러리 저장소입니다. 프로젝트 소스는 아니지만 다음 빌드가 오래 걸릴 수 있습니다."
+        return "Libraries downloaded by Java/Maven projects. This is not project source, but the next build may take longer."
     if "npm" in path or "pnpm" in path or "yarn" in path:
-        return "JavaScript 패키지 관리자가 내려받은 패키지·압축 파일 캐시입니다. 다음 설치 때 다시 다운로드됩니다."
+        return "Packages and archives cached by a JavaScript package manager. They are downloaded again during a later install."
     if "pip" in path or "python" in path and "cache" in path:
-        return "Python 패키지 설치 과정에서 생성된 다운로드·빌드 캐시입니다. 패키지를 다시 설치하면 재생성될 수 있습니다."
+        return "Download and build caches created while installing Python packages. They may be regenerated during a later install."
     if item.safety == "trash":
-        return "휴지통에 이미 들어간 파일입니다. 원래 위치의 파일은 아니지만, 비우면 Finder에서 복구할 수 없습니다."
+        return "Files already in Trash. They are no longer in their original locations, but cannot be restored from Finder after removal."
     if item.safety == "rotated_log":
-        return "현재 실행 중인 로그가 아니라 진단용으로 남은 오래된 로그·충돌 보고서입니다."
+        return "Older diagnostic logs and crash reports, not currently active logs."
     if item.safety == "cache":
-        return "앱이나 개발 도구가 속도를 높이기 위해 저장한 재생성 가능한 캐시입니다."
-    return "사용자가 만든 데이터일 수 있거나 복구 비용이 있는 항목입니다. 경로와 용도를 확인한 뒤 삭제해야 합니다."
+        return "A recreatable cache stored by an app or development tool to make future work faster."
+    return "This may be user data or costly to restore. Check the path and purpose before deleting it."
 
 
 def safety_summary(item: Candidate) -> str:
     if "ms-playwright" in item.path.lower() or "playwright" in item.path.lower():
-        return "대체로 안전합니다. 삭제 뒤 Playwright 테스트가 필요해지면 브라우저 약 1GB를 다시 내려받습니다."
+        return "Usually safe to remove. Playwright will download roughly 1 GB of browsers again when tests need them."
     if item.safety == "cache":
-        return "대체로 안전합니다. 원본 데이터가 아니라 캐시이지만, 다음 실행이나 빌드가 느려지고 재다운로드가 필요할 수 있습니다."
+        return "Usually safe to remove. It is not original data, but the next launch or build may be slower and require downloads."
     if item.safety == "trash":
-        return "안전성은 높지만 영구 삭제입니다. 이 앱으로 비우면 휴지통에서도 복구할 수 없습니다."
+        return "High confidence, but permanent. Removing it here also prevents recovery from Trash."
     if item.safety == "rotated_log":
-        return "대체로 안전합니다. 다만 문제를 조사 중이라면 진단 로그를 보관하는 편이 좋습니다."
-    return "주의가 필요합니다. 사용자 백업이나 내려받은 의존성일 수 있으므로, 용도와 재다운로드 비용을 확인하세요."
+        return "Usually safe to remove, unless you are investigating a problem and need the diagnostic logs."
+    return "Use caution. This may be a user backup or downloaded dependency, so check its purpose and restoration cost."
 
 
 def path_is_within(child: Path, parent: Path) -> bool:
@@ -262,38 +262,60 @@ def directory_size(path: Path, progress_label: Optional[str] = None) -> tuple[in
     return total, newest, inaccessible
 
 
-def mac_targets(home: Path) -> list[TargetSpec]:
-    return [
-        TargetSpec(str(home / ".Trash"), "Trash", "Trash", "trash", "Files already in Trash", "children"),
-        TargetSpec(str(home / "Library" / "Caches"), "Library cache", "Caches", "cache", "Application caches", "children"),
-        TargetSpec(str(home / "Library" / "Logs"), "Library logs", "Logs", "rotated_log", "Application and diagnostic logs", "children"),
-        TargetSpec(str(home / "Library" / "Developer" / "Xcode" / "DerivedData"), "Xcode DerivedData", "Developer", "cache", "Xcode build products; regenerated by Xcode", "children"),
-        TargetSpec(str(home / "Library" / "Developer" / "CoreSimulator" / "Caches"), "Simulator cache", "Developer", "cache", "iOS Simulator caches; regenerated", "children"),
-        TargetSpec(str(home / "Library" / "Developer" / "CoreSimulator" / "Devices" / "*" / "data" / "Library" / "Caches"), "Simulator app cache", "Developer", "cache", "Per-simulator application cache; regenerated", "children"),
-        TargetSpec(str(home / "Library" / "Containers" / "*" / "Data" / "Library" / "Caches"), "Sandbox app cache", "Caches", "cache", "Per-application sandbox cache", "children"),
-        TargetSpec(str(home / "Library" / "Group Containers" / "*" / "Library" / "Caches"), "Group container cache", "Caches", "cache", "Shared application cache", "children"),
-        TargetSpec(str(home / "Library" / "Application Support" / "CrashReporter"), "Crash reports", "Logs", "rotated_log", "Crash reports used only for diagnostics", "children"),
-        TargetSpec(str(home / "Library" / "Application Support" / "MobileSync" / "Backup"), "iPhone/iPad backup", "Review", "review", "Personal device backups: inspect before deletion", "children"),
-        TargetSpec("/Library/Caches", "System cache", "System", "cache", "System-level caches; may require administrator permission", "children", True),
-        TargetSpec("/Library/Logs", "System application logs", "System", "rotated_log", "Logs from installed applications; may require administrator permission", "children", True),
-    ]
+def load_target_config() -> dict:
+    """Load the versioned, repository-owned cleanup target configuration."""
+
+    try:
+        with TARGET_CONFIG_PATH.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"Cannot load cleanup target configuration at {TARGET_CONFIG_PATH}: {error}") from error
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise RuntimeError(f"Unsupported cleanup target configuration: {TARGET_CONFIG_PATH}")
+    return data
 
 
-def linux_targets(home: Path) -> list[TargetSpec]:
-    cache_home = Path(os.environ.get("XDG_CACHE_HOME", home / ".cache"))
-    return [
-        TargetSpec(str(home / ".local" / "share" / "Trash" / "files"), "Trash", "Trash", "trash", "Files already in Trash", "children"),
-        TargetSpec(str(cache_home), "Application cache", "Caches", "cache", "XDG application caches", "children"),
-        TargetSpec(str(home / ".var" / "app" / "*" / "cache"), "Flatpak app cache", "Caches", "cache", "Flatpak application cache", "children"),
-        TargetSpec(str(home / ".gradle" / "caches"), "Gradle cache", "Developer", "cache", "Build dependency cache; recreated by Gradle", "children"),
-        TargetSpec(str(home / ".cargo" / "registry" / "cache"), "Cargo crate archive cache", "Developer", "cache", "Downloaded Cargo crate archives", "children"),
-        TargetSpec(str(home / ".rustup" / "downloads"), "Rustup downloads", "Developer", "cache", "Rust toolchain installer downloads", "children"),
-        TargetSpec(str(home / ".m2" / "repository"), "Maven repository", "Review", "review", "Downloaded dependencies; can be restored but may be costly", "children"),
-        TargetSpec(str(home / ".nuget" / "packages"), "NuGet packages", "Review", "review", "Downloaded packages; projects may need to restore them", "children"),
-        TargetSpec(str(home / ".steam" / "steam" / "steamapps" / "shadercache"), "Steam shader cache", "Caches", "cache", "Game shader cache; rebuilt when games launch", "children"),
-        TargetSpec(str(home / ".local" / "share" / "Steam" / "steamapps" / "shadercache"), "Steam shader cache", "Caches", "cache", "Game shader cache; rebuilt when games launch", "children"),
-        TargetSpec("/var/log", "Rotated system logs", "System", "rotated_log", "Only old rotated/compressed logs, not active logs", "rotated_logs", True),
-    ]
+def target_from_config(record: object, home: Path) -> TargetSpec:
+    if not isinstance(record, dict):
+        raise RuntimeError("Invalid cleanup target configuration entry")
+    required = ("pattern", "label", "group", "safety", "reason")
+    if any(not isinstance(record.get(key), str) for key in required):
+        raise RuntimeError("Cleanup target entries need string pattern, label, group, safety, and reason fields")
+    mode = record.get("mode", "children")
+    requires_admin = record.get("requires_admin", False)
+    if (
+        not isinstance(mode, str)
+        or mode not in {"children", "item", "rotated_logs"}
+        or record["safety"] not in {"cache", "trash", "rotated_log", "review"}
+        or not isinstance(requires_admin, bool)
+    ):
+        raise RuntimeError("Cleanup target entry has an invalid safety, mode, or requires_admin value")
+    variables = {
+        "home": str(home),
+        "xdg_cache_home": str(Path(os.environ.get("XDG_CACHE_HOME", home / ".cache"))),
+    }
+    try:
+        pattern = record["pattern"].format(**variables)
+    except (KeyError, ValueError) as error:
+        raise RuntimeError(f"Cleanup target contains an unsupported placeholder: {error}") from error
+    return TargetSpec(
+        pattern=pattern,
+        label=record["label"],
+        group=record["group"],
+        safety=record["safety"],
+        reason=record["reason"],
+        mode=mode,
+        requires_admin=requires_admin,
+    )
+
+
+def configured_targets(home: Path, system: str) -> list[TargetSpec]:
+    data = load_target_config()
+    platforms = data.get("platforms")
+    records = platforms.get(system) if isinstance(platforms, dict) else None
+    if not isinstance(records, list):
+        raise RuntimeError(f"No cleanup targets configured for {system}")
+    return [target_from_config(record, home) for record in records]
 
 
 INSTALLER_SUFFIXES = {".dmg", ".pkg", ".iso", ".zip", ".tar", ".gz", ".bz2", ".xz", ".deb", ".rpm", ".appimage", ".msi"}
@@ -320,12 +342,11 @@ def download_installers(home: Path) -> Iterable[tuple[Path, TargetSpec]]:
 
 def safe_roots(home: Path) -> list[TargetSpec]:
     system = platform.system()
-    targets = mac_targets(home) if system == "Darwin" else linux_targets(home)
     # This tool has deliberately bounded support rather than pretending that
     # every Unix-like system's filesystem conventions are compatible.
     if system not in {"Darwin", "Linux"}:
         raise RuntimeError(f"Unsupported platform: {system}. This script supports macOS and Linux.")
-    return targets
+    return configured_targets(home, system)
 
 
 def rotated_log_files(root: Path) -> Iterable[Path]:
@@ -659,14 +680,12 @@ def assess_with_claude(
 
 
 def download_spec(home: Path) -> TargetSpec:
-    return TargetSpec(
-        str(home / "Downloads"),
-        "Old installer/archive",
-        "Review",
-        "review",
-        "Old installer or archive in Downloads; inspect before deletion",
-        "item",
-    )
+    data = load_target_config()
+    special_targets = data.get("special_targets")
+    record = special_targets.get("download_installer") if isinstance(special_targets, dict) else None
+    if record is None:
+        raise RuntimeError("No download installer target is configured")
+    return target_from_config(record, home)
 
 
 def current_allowed_scopes(home: Path) -> list[tuple[Path, TargetSpec]]:
