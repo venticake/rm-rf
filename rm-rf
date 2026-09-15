@@ -30,11 +30,13 @@ from typing import Callable, Iterable, Optional
 
 
 APP_NAME = "rm-rf"
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 MIB = 1024 * 1024
 GIB = 1024 * MIB
 DEFAULT_MIN_BYTES = 50 * MIB
 AI_MIN_BYTES = 250 * MIB
+DEFAULT_CACHE_TTL_HOURS = 24
+SECONDS_PER_HOUR = 60 * 60
 
 
 @dataclass(frozen=True)
@@ -437,13 +439,19 @@ def load_cache(cache_dir: Path) -> Optional[dict]:
         return None
 
 
-def write_cache(cache_dir: Path, home: Path, min_bytes: int, candidates: list[Candidate]) -> None:
+def write_cache(
+    cache_dir: Path,
+    home: Path,
+    min_bytes: int,
+    candidates: list[Candidate],
+    scanned_at: Optional[float] = None,
+) -> None:
     cache_dir.mkdir(parents=True, exist_ok=True)
     destination = cache_path(cache_dir)
     temporary = destination.with_suffix(".json.tmp")
     data = {
         "version": CACHE_VERSION,
-        "scanned_at": time.time(),
+        "scanned_at": time.time() if scanned_at is None else scanned_at,
         "home": str(home),
         "platform": platform.system(),
         "min_bytes": min_bytes,
@@ -462,6 +470,30 @@ def load_candidates(cache_dir: Path) -> tuple[Optional[dict], list[Candidate]]:
         return data, [Candidate.from_dict(value) for value in data["items"]]
     except (KeyError, TypeError):
         return None, []
+
+
+def cache_age_seconds(data: dict) -> Optional[float]:
+    try:
+        return max(0.0, time.time() - float(data["scanned_at"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def cache_is_fresh(data: Optional[dict], home: Path, ttl_seconds: float) -> bool:
+    if not data or data.get("home") != str(home) or ttl_seconds <= 0:
+        return False
+    age = cache_age_seconds(data)
+    return age is not None and age < ttl_seconds
+
+
+def short_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "an unknown age"
+    if seconds < SECONDS_PER_HOUR:
+        return f"{max(1, int(seconds // 60))}m"
+    if seconds < 24 * SECONDS_PER_HOUR:
+        return f"{seconds / SECONDS_PER_HOUR:.1f}h"
+    return f"{seconds / (24 * SECONDS_PER_HOUR):.1f}d"
 
 
 def disk_summary(home: Path) -> str:
@@ -756,13 +788,20 @@ def scan_and_save(home: Path, cache_dir: Path, min_bytes: int, use_ai: bool) -> 
     return results
 
 
-def plain_interactive(home: Path, cache_dir: Path, min_bytes: int, use_ai: bool) -> int:
+def plain_interactive(home: Path, cache_dir: Path, min_bytes: int, use_ai: bool, cache_ttl_seconds: float) -> int:
     data, items = load_candidates(cache_dir)
-    if data and data.get("home") == str(home):
+    if cache_is_fresh(data, home, cache_ttl_seconds):
         timestamp = dt.datetime.fromtimestamp(data["scanned_at"]).strftime("%Y-%m-%d %H:%M")
-        console.info(f"Using cached scan from {timestamp}. Type `rescan` to measure again.")
+        console.info(f"Using cached scan from {timestamp} (age {short_duration(cache_age_seconds(data))}).")
     else:
+        if data and data.get("home") == str(home):
+            console.info(
+                f"Cached scan is {short_duration(cache_age_seconds(data))} old "
+                f"(limit {short_duration(cache_ttl_seconds)}); rescanning now."
+            )
         items = scan_and_save(home, cache_dir, min_bytes, use_ai)
+        data = load_cache(cache_dir)
+    scanned_at = data.get("scanned_at") if data else None
     render_items(items, home, limit=30)
     print("Commands: list [all], rescan, ai N[,N], delete N[,N], quit")
     while True:
@@ -782,16 +821,18 @@ def plain_interactive(home: Path, cache_dir: Path, min_bytes: int, use_ai: bool)
                 render_items(items, home, None if argument.strip().lower() == "all" else 30)
             elif name in {"rescan", "r", "reload"}:
                 items = scan_and_save(home, cache_dir, min_bytes, use_ai)
+                refreshed = load_cache(cache_dir)
+                scanned_at = refreshed.get("scanned_at") if refreshed else None
                 render_items(items, home, limit=30)
             elif name == "ai":
                 indexes = indexes_from_text(argument, len(items))
                 assess_with_claude(items, {items[index - 1].id for index in indexes}, force=True)
-                write_cache(cache_dir, home, min_bytes, items)
+                write_cache(cache_dir, home, min_bytes, items, scanned_at=scanned_at)
                 render_items(items, home, limit=30)
             elif name in {"delete", "d", "clean"}:
                 indexes = indexes_from_text(argument, len(items))
                 items = delete_selection(items, indexes, home)
-                write_cache(cache_dir, home, min_bytes, items)
+                write_cache(cache_dir, home, min_bytes, items, scanned_at=scanned_at)
             elif name in {"help", "h", "?"}:
                 print("Use numbers from the current list: `delete 1,3-5`, `ai 2`, `list all`, or `rescan`.")
             else:
@@ -803,12 +844,21 @@ def plain_interactive(home: Path, cache_dir: Path, min_bytes: int, use_ai: bool)
 class RmRfTui:
     """A keyboard-driven terminal UI with an installer-like visual hierarchy."""
 
-    def __init__(self, screen: "curses._CursesWindow", home: Path, cache_dir: Path, min_bytes: int, use_ai: bool) -> None:
+    def __init__(
+        self,
+        screen: "curses._CursesWindow",
+        home: Path,
+        cache_dir: Path,
+        min_bytes: int,
+        use_ai: bool,
+        cache_ttl_seconds: float,
+    ) -> None:
         self.screen = screen
         self.home = home
         self.cache_dir = cache_dir
         self.min_bytes = min_bytes
         self.use_ai = use_ai
+        self.cache_ttl_seconds = cache_ttl_seconds
         self.items: list[Candidate] = []
         self.selected: set[str] = set()
         self.cursor = 0
@@ -1143,7 +1193,7 @@ class RmRfTui:
             reviewed, problems = assess_with_claude(self.items, {focused.id}, force=True)
             outcome["reviewed"] = reviewed
             outcome["problems"] = problems
-            write_cache(self.cache_dir, self.home, self.min_bytes, self.items)
+            write_cache(self.cache_dir, self.home, self.min_bytes, self.items, scanned_at=self.scanned_at)
 
         self.run_work("Claude is considering the focused item…", operation, overlay=True)
         if outcome["reviewed"]:
@@ -1209,18 +1259,23 @@ class RmRfTui:
         self.items = kept
         self.selected.difference_update({item.id for item in chosen})
         self.cursor = min(self.cursor, max(0, len(self.items) - 1))
-        write_cache(self.cache_dir, self.home, self.min_bytes, self.items)
+        write_cache(self.cache_dir, self.home, self.min_bytes, self.items, scanned_at=self.scanned_at)
         removed = len(chosen) - failed
         self.status = f"Removed {removed} item(s), estimated {human_bytes(reclaim)} reclaimed." if not failed else f"Removed {removed}; {failed} item(s) were safely skipped."
 
     def load_initial_state(self) -> None:
         data, items = load_candidates(self.cache_dir)
-        if data and data.get("home") == str(self.home):
+        if cache_is_fresh(data, self.home, self.cache_ttl_seconds):
             self.items = items
             self.scanned_at = data.get("scanned_at")
             stamp = dt.datetime.fromtimestamp(self.scanned_at).strftime("%Y-%m-%d %H:%M") if self.scanned_at else "earlier"
-            self.status = f"Cached scan from {stamp}. Press r only when you want fresh measurements."
+            self.status = f"Cached scan from {stamp} (age {short_duration(cache_age_seconds(data))})."
         else:
+            if data and data.get("home") == str(self.home):
+                self.status = (
+                    f"Cache expired after {short_duration(cache_age_seconds(data))} "
+                    f"(limit {short_duration(self.cache_ttl_seconds)}); rescanning now."
+                )
             self.refresh_scan()
 
     def run(self) -> int:
@@ -1251,14 +1306,21 @@ class RmRfTui:
                 self.show_detail()
 
 
-def interactive(home: Path, cache_dir: Path, min_bytes: int, use_ai: bool, plain: bool = False) -> int:
+def interactive(
+    home: Path,
+    cache_dir: Path,
+    min_bytes: int,
+    use_ai: bool,
+    cache_ttl_seconds: float,
+    plain: bool = False,
+) -> int:
     if plain or not sys.stdin.isatty() or not sys.stdout.isatty():
-        return plain_interactive(home, cache_dir, min_bytes, use_ai)
+        return plain_interactive(home, cache_dir, min_bytes, use_ai, cache_ttl_seconds)
     try:
-        return curses.wrapper(lambda screen: RmRfTui(screen, home, cache_dir, min_bytes, use_ai).run())
+        return curses.wrapper(lambda screen: RmRfTui(screen, home, cache_dir, min_bytes, use_ai, cache_ttl_seconds).run())
     except curses.error as error:
         console.warn(f"Terminal UI could not start ({error}); using plain console mode.")
-        return plain_interactive(home, cache_dir, min_bytes, use_ai)
+        return plain_interactive(home, cache_dir, min_bytes, use_ai, cache_ttl_seconds)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1273,6 +1335,13 @@ def parser() -> argparse.ArgumentParser:
     ai_options.add_argument("--no-ai", dest="ai", action="store_false", default=argparse.SUPPRESS, help="Skip Claude review and keep uncertain items as REVIEW")
     argument_parser.add_argument("--plain", action="store_true", help="Use the simple line-based console instead of the full-screen terminal UI")
     argument_parser.add_argument("--min-size", type=float, default=50, metavar="MIB", help="Hide candidates smaller than this size")
+    argument_parser.add_argument(
+        "--cache-ttl-hours",
+        type=float,
+        default=DEFAULT_CACHE_TTL_HOURS,
+        metavar="HOURS",
+        help="Rescan automatically once a cached scan reaches this age; 0 disables cache reuse",
+    )
     argument_parser.add_argument("--cache-dir", type=Path, default=Path.home() / ".cache" / "rm-rf", help="Where scan results are stored")
     return argument_parser
 
@@ -1281,20 +1350,29 @@ def main() -> int:
     args = parser().parse_args()
     if args.min_size < 0:
         parser().error("--min-size must be zero or greater")
+    if args.cache_ttl_hours < 0:
+        parser().error("--cache-ttl-hours must be zero or greater")
     home = Path.home().resolve()
     cache_dir = args.cache_dir.expanduser().resolve()
     min_bytes = int(args.min_size * MIB)
+    cache_ttl_seconds = args.cache_ttl_hours * SECONDS_PER_HOUR
     try:
         if args.command == "interactive":
-            return interactive(home, cache_dir, min_bytes, args.ai, args.plain)
+            return interactive(home, cache_dir, min_bytes, args.ai, cache_ttl_seconds, args.plain)
         if args.command == "scan":
             items = scan_and_save(home, cache_dir, min_bytes, args.ai)
             render_items(items, home)
             return 0
         data, items = load_candidates(cache_dir)
-        if not data:
-            console.error("No cached scan. Run `rm-rf scan` first.")
-            return 2
+        if not cache_is_fresh(data, home, cache_ttl_seconds):
+            if data and data.get("home") == str(home):
+                console.info(
+                    f"Cached scan is {short_duration(cache_age_seconds(data))} old "
+                    f"(limit {short_duration(cache_ttl_seconds)}); rescanning now."
+                )
+            else:
+                console.info("No usable cached scan; scanning now.")
+            items = scan_and_save(home, cache_dir, min_bytes, args.ai)
         render_items(items, home)
         return 0
     except RuntimeError as error:
