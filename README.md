@@ -23,4 +23,5 @@ Press `i` for the item's path, what it is, why it is safe or risky to remove, an
 ## Advanced
 
 - Scan results expire after **24 hours** and refresh automatically. Use `--cache-ttl-hours 6` to change it, or `0` to always rescan.
-- Press `r` to rescan now, `i` for item details, and `a` for a Claude review of the focused item.
+- Press `r` to rescan now and `i` for item details.
+- Claude CLI: `rm-rf` uses your signed-in `claude` CLI for automatic reviews during a new scan, or when you press `a` on the focused item. `i` only shows saved details and the latest Claude verdict; it does not make a Claude request.
