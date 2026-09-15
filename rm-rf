@@ -1,0 +1,1306 @@
+#!/usr/bin/env python3
+"""A conservative, cache-aware disk cleanup console for macOS and Ubuntu.
+
+It deliberately scans known cleanup locations rather than recursively scanning
+the whole home directory.  Nothing is deleted without an explicit selection
+and a typed confirmation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import datetime as dt
+import glob
+import json
+import math
+import os
+import platform
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import textwrap
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Callable, Iterable, Optional
+
+
+APP_NAME = "rm-rf"
+CACHE_VERSION = 2
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+DEFAULT_MIN_BYTES = 50 * MIB
+AI_MIN_BYTES = 250 * MIB
+
+
+@dataclass(frozen=True)
+class TargetSpec:
+    """A deliberately bounded cleanup target.
+
+    ``mode=children`` exposes the immediate children of a folder, avoiding a
+    useless, overly broad "Library" or ".cache" deletion entry.
+    """
+
+    pattern: str
+    label: str
+    group: str
+    safety: str  # cache, trash, rotated_log, review
+    reason: str
+    mode: str = "children"  # children, item, rotated_logs
+    requires_admin: bool = False
+
+
+@dataclass
+class Candidate:
+    id: str
+    path: str
+    scope: str
+    label: str
+    group: str
+    safety: str
+    reason: str
+    bytes: int
+    modified_at: float
+    inaccessible_entries: int = 0
+    requires_admin: bool = False
+    mode: str = "children"
+    priority: int = 0
+    recommendation: str = "review"  # delete, review, keep
+    ai_reason: str = ""
+    ai_confidence: Optional[float] = None
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "Candidate":
+        fields = {name: value.get(name) for name in cls.__dataclass_fields__}
+        return cls(**fields)
+
+
+class Console:
+    def __init__(self) -> None:
+        self.color = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+        self.handler: Optional[Callable[[str, str], None]] = None
+
+    def _paint(self, text: str, code: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.color else text
+
+    def info(self, text: str) -> None:
+        if self.handler:
+            self.handler("info", text)
+            return
+        print(self._paint("•", "36") + " " + text, flush=True)
+
+    def good(self, text: str) -> None:
+        if self.handler:
+            self.handler("good", text)
+            return
+        print(self._paint("✓", "32") + " " + text, flush=True)
+
+    def warn(self, text: str) -> None:
+        if self.handler:
+            self.handler("warn", text)
+            return
+        print(self._paint("!", "33") + " " + text, flush=True)
+
+    def error(self, text: str) -> None:
+        if self.handler:
+            self.handler("error", text)
+            return
+        print(self._paint("✗", "31") + " " + text, file=sys.stderr, flush=True)
+
+
+console = Console()
+
+
+def human_bytes(value: int) -> str:
+    if value < 1024:
+        return f"{value} B"
+    units = ("KiB", "MiB", "GiB", "TiB", "PiB")
+    number = float(value)
+    for unit in units:
+        number /= 1024
+        if number < 1024 or unit == units[-1]:
+            return f"{number:.1f} {unit}"
+    return f"{value} B"
+
+
+def human_time(timestamp: float) -> str:
+    if not timestamp:
+        return "unknown"
+    delta = max(0, time.time() - timestamp)
+    if delta < 86400:
+        return "today"
+    if delta < 86400 * 60:
+        return f"{int(delta // 86400)} days ago"
+    return dt.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+
+
+def item_identity(item: Candidate) -> str:
+    """Explain what a candidate is, not merely whether it is deletable."""
+
+    path = item.path.lower()
+    if "ms-playwright" in path or "playwright" in path:
+        return (
+            "웹 자동화 테스트용 Playwright 브라우저 바이너리 캐시입니다. Chromium·Firefox·WebKit을 "
+            "테스트 실행용으로 내려받아 둔 것이며, Node/Python 프로젝트·테스트 도구·개발 의존성이 "
+            "직접 설치하지 않아도 만들 수 있습니다."
+        )
+    if "deriveddata" in path:
+        return "Xcode가 프로젝트를 빌드하면서 만든 중간 산출물·인덱스입니다. 원본 소스나 앱 자체는 아닙니다."
+    if "coresimulator" in path or "simulator" in item.label.lower():
+        return "Xcode iOS Simulator가 앱을 실행하며 만든 캐시입니다. Simulator 또는 앱을 다시 열면 재생성됩니다."
+    if "crashreport" in path or "diagnosticreport" in path:
+        return "앱 충돌을 분석하기 위한 진단 보고서입니다. 앱 실행 데이터나 개인 문서 자체는 아닙니다."
+    if ".gradle" in path:
+        return "Gradle 빌드 도구가 내려받은 플러그인·의존성 캐시입니다. 다음 빌드에서 다시 다운로드될 수 있습니다."
+    if ".m2" in path or "maven" in item.label.lower():
+        return "Java/Maven 프로젝트가 내려받은 라이브러리 저장소입니다. 프로젝트 소스는 아니지만 다음 빌드가 오래 걸릴 수 있습니다."
+    if "npm" in path or "pnpm" in path or "yarn" in path:
+        return "JavaScript 패키지 관리자가 내려받은 패키지·압축 파일 캐시입니다. 다음 설치 때 다시 다운로드됩니다."
+    if "pip" in path or "python" in path and "cache" in path:
+        return "Python 패키지 설치 과정에서 생성된 다운로드·빌드 캐시입니다. 패키지를 다시 설치하면 재생성될 수 있습니다."
+    if item.safety == "trash":
+        return "휴지통에 이미 들어간 파일입니다. 원래 위치의 파일은 아니지만, 비우면 Finder에서 복구할 수 없습니다."
+    if item.safety == "rotated_log":
+        return "현재 실행 중인 로그가 아니라 진단용으로 남은 오래된 로그·충돌 보고서입니다."
+    if item.safety == "cache":
+        return "앱이나 개발 도구가 속도를 높이기 위해 저장한 재생성 가능한 캐시입니다."
+    return "사용자가 만든 데이터일 수 있거나 복구 비용이 있는 항목입니다. 경로와 용도를 확인한 뒤 삭제해야 합니다."
+
+
+def safety_summary(item: Candidate) -> str:
+    if "ms-playwright" in item.path.lower() or "playwright" in item.path.lower():
+        return "대체로 안전합니다. 삭제 뒤 Playwright 테스트가 필요해지면 브라우저 약 1GB를 다시 내려받습니다."
+    if item.safety == "cache":
+        return "대체로 안전합니다. 원본 데이터가 아니라 캐시이지만, 다음 실행이나 빌드가 느려지고 재다운로드가 필요할 수 있습니다."
+    if item.safety == "trash":
+        return "안전성은 높지만 영구 삭제입니다. 이 앱으로 비우면 휴지통에서도 복구할 수 없습니다."
+    if item.safety == "rotated_log":
+        return "대체로 안전합니다. 다만 문제를 조사 중이라면 진단 로그를 보관하는 편이 좋습니다."
+    return "주의가 필요합니다. 사용자 백업이나 내려받은 의존성일 수 있으므로, 용도와 재다운로드 비용을 확인하세요."
+
+
+def path_is_within(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve(strict=False).relative_to(parent.resolve(strict=False))
+        return True
+    except ValueError:
+        return False
+
+
+def allocated_bytes(item_stat: os.stat_result) -> int:
+    # st_blocks is disk allocation on POSIX.  It gives a better reclaim estimate
+    # than logical length for sparse files.  Fall back for unusual filesystems.
+    blocks = getattr(item_stat, "st_blocks", None)
+    return int(blocks * 512) if blocks is not None else int(item_stat.st_size)
+
+
+def directory_size(path: Path, progress_label: Optional[str] = None) -> tuple[int, float, int]:
+    """Return allocated bytes, newest mtime, inaccessible-entry count.
+
+    Symlinks and other mounted filesystems are not followed.  This prevents a
+    candidate such as a cache directory from escaping into unrelated data.
+    """
+
+    try:
+        root_stat = path.lstat()
+    except (OSError, PermissionError):
+        return 0, 0.0, 1
+    if stat.S_ISLNK(root_stat.st_mode):
+        return 0, root_stat.st_mtime, 1
+    if not stat.S_ISDIR(root_stat.st_mode):
+        return allocated_bytes(root_stat), root_stat.st_mtime, 0
+
+    total = allocated_bytes(root_stat)
+    newest = root_stat.st_mtime
+    inaccessible = 0
+    root_device = root_stat.st_dev
+    stack = [path]
+    seen_dirs: set[tuple[int, int]] = {(root_stat.st_dev, root_stat.st_ino)}
+    seen_files: set[tuple[int, int]] = set()
+    entry_count = 0
+    last_progress = time.monotonic()
+
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    entry_count += 1
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except (OSError, PermissionError):
+                        inaccessible += 1
+                        continue
+                    newest = max(newest, entry_stat.st_mtime)
+                    mode = entry_stat.st_mode
+                    if stat.S_ISLNK(mode):
+                        continue
+                    if stat.S_ISDIR(mode):
+                        inode = (entry_stat.st_dev, entry_stat.st_ino)
+                        if entry_stat.st_dev != root_device or inode in seen_dirs:
+                            continue
+                        seen_dirs.add(inode)
+                        total += allocated_bytes(entry_stat)
+                        stack.append(Path(entry.path))
+                    elif stat.S_ISREG(mode):
+                        inode = (entry_stat.st_dev, entry_stat.st_ino)
+                        if inode in seen_files:
+                            continue
+                        seen_files.add(inode)
+                        total += allocated_bytes(entry_stat)
+                    if progress_label and time.monotonic() - last_progress >= 3:
+                        console.info(f"Still measuring {progress_label}: {entry_count:,} entries, at least {human_bytes(total)}")
+                        last_progress = time.monotonic()
+        except (OSError, PermissionError):
+            inaccessible += 1
+    return total, newest, inaccessible
+
+
+def mac_targets(home: Path) -> list[TargetSpec]:
+    return [
+        TargetSpec(str(home / ".Trash"), "Trash", "Trash", "trash", "Files already in Trash", "children"),
+        TargetSpec(str(home / "Library" / "Caches"), "Library cache", "Caches", "cache", "Application caches", "children"),
+        TargetSpec(str(home / "Library" / "Logs"), "Library logs", "Logs", "rotated_log", "Application and diagnostic logs", "children"),
+        TargetSpec(str(home / "Library" / "Developer" / "Xcode" / "DerivedData"), "Xcode DerivedData", "Developer", "cache", "Xcode build products; regenerated by Xcode", "children"),
+        TargetSpec(str(home / "Library" / "Developer" / "CoreSimulator" / "Caches"), "Simulator cache", "Developer", "cache", "iOS Simulator caches; regenerated", "children"),
+        TargetSpec(str(home / "Library" / "Developer" / "CoreSimulator" / "Devices" / "*" / "data" / "Library" / "Caches"), "Simulator app cache", "Developer", "cache", "Per-simulator application cache; regenerated", "children"),
+        TargetSpec(str(home / "Library" / "Containers" / "*" / "Data" / "Library" / "Caches"), "Sandbox app cache", "Caches", "cache", "Per-application sandbox cache", "children"),
+        TargetSpec(str(home / "Library" / "Group Containers" / "*" / "Library" / "Caches"), "Group container cache", "Caches", "cache", "Shared application cache", "children"),
+        TargetSpec(str(home / "Library" / "Application Support" / "CrashReporter"), "Crash reports", "Logs", "rotated_log", "Crash reports used only for diagnostics", "children"),
+        TargetSpec(str(home / "Library" / "Application Support" / "MobileSync" / "Backup"), "iPhone/iPad backup", "Review", "review", "Personal device backups: inspect before deletion", "children"),
+        TargetSpec("/Library/Caches", "System cache", "System", "cache", "System-level caches; may require administrator permission", "children", True),
+        TargetSpec("/Library/Logs", "System application logs", "System", "rotated_log", "Logs from installed applications; may require administrator permission", "children", True),
+    ]
+
+
+def linux_targets(home: Path) -> list[TargetSpec]:
+    cache_home = Path(os.environ.get("XDG_CACHE_HOME", home / ".cache"))
+    return [
+        TargetSpec(str(home / ".local" / "share" / "Trash" / "files"), "Trash", "Trash", "trash", "Files already in Trash", "children"),
+        TargetSpec(str(cache_home), "Application cache", "Caches", "cache", "XDG application caches", "children"),
+        TargetSpec(str(home / ".var" / "app" / "*" / "cache"), "Flatpak app cache", "Caches", "cache", "Flatpak application cache", "children"),
+        TargetSpec(str(home / ".gradle" / "caches"), "Gradle cache", "Developer", "cache", "Build dependency cache; recreated by Gradle", "children"),
+        TargetSpec(str(home / ".cargo" / "registry" / "cache"), "Cargo crate archive cache", "Developer", "cache", "Downloaded Cargo crate archives", "children"),
+        TargetSpec(str(home / ".rustup" / "downloads"), "Rustup downloads", "Developer", "cache", "Rust toolchain installer downloads", "children"),
+        TargetSpec(str(home / ".m2" / "repository"), "Maven repository", "Review", "review", "Downloaded dependencies; can be restored but may be costly", "children"),
+        TargetSpec(str(home / ".nuget" / "packages"), "NuGet packages", "Review", "review", "Downloaded packages; projects may need to restore them", "children"),
+        TargetSpec(str(home / ".steam" / "steam" / "steamapps" / "shadercache"), "Steam shader cache", "Caches", "cache", "Game shader cache; rebuilt when games launch", "children"),
+        TargetSpec(str(home / ".local" / "share" / "Steam" / "steamapps" / "shadercache"), "Steam shader cache", "Caches", "cache", "Game shader cache; rebuilt when games launch", "children"),
+        TargetSpec("/var/log", "Rotated system logs", "System", "rotated_log", "Only old rotated/compressed logs, not active logs", "rotated_logs", True),
+    ]
+
+
+INSTALLER_SUFFIXES = {".dmg", ".pkg", ".iso", ".zip", ".tar", ".gz", ".bz2", ".xz", ".deb", ".rpm", ".appimage", ".msi"}
+
+
+def download_installers(home: Path) -> Iterable[tuple[Path, TargetSpec]]:
+    spec = download_spec(home)
+    downloads = home / "Downloads"
+    try:
+        with os.scandir(downloads) as entries:
+            for entry in entries:
+                name = entry.name.lower()
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if any(name.endswith(suffix) for suffix in INSTALLER_SUFFIXES):
+                    try:
+                        if time.time() - entry.stat(follow_symlinks=False).st_mtime >= 30 * 86400:
+                            yield Path(entry.path), spec
+                    except OSError:
+                        continue
+    except (OSError, PermissionError):
+        return
+
+
+def safe_roots(home: Path) -> list[TargetSpec]:
+    system = platform.system()
+    targets = mac_targets(home) if system == "Darwin" else linux_targets(home)
+    # This tool has deliberately bounded support rather than pretending that
+    # every Unix-like system's filesystem conventions are compatible.
+    if system not in {"Darwin", "Linux"}:
+        raise RuntimeError(f"Unsupported platform: {system}. This script supports macOS and Linux.")
+    return targets
+
+
+def rotated_log_files(root: Path) -> Iterable[Path]:
+    """Yield only clearly rotated log files, no live files, to depth 3."""
+    suffix = re.compile(r"(?:\.gz|\.bz2|\.xz|\.zst|\.old|\.bak|\.\d+)$", re.IGNORECASE)
+    stack: list[tuple[Path, int]] = [(root, 0)]
+    while stack:
+        current, depth = stack.pop()
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        entry_stat = entry.stat(follow_symlinks=False)
+                    except (OSError, PermissionError):
+                        continue
+                    if stat.S_ISREG(entry_stat.st_mode) and suffix.search(entry.name):
+                        yield Path(entry.path)
+                    elif stat.S_ISDIR(entry_stat.st_mode) and depth < 3:
+                        stack.append((Path(entry.path), depth + 1))
+        except (OSError, PermissionError):
+            continue
+
+
+def calculate_priority(candidate: Candidate) -> int:
+    """Combine reclaim value with deletion confidence, conservatively."""
+    safety_points = {"trash": 58, "cache": 52, "rotated_log": 45, "review": 15}[candidate.safety]
+    size_points = min(30, int(math.log2(max(candidate.bytes, 1) / MIB + 1) * 3.2))
+    age_days = max(0.0, (time.time() - candidate.modified_at) / 86400) if candidate.modified_at else 0.0
+    age_points = min(10, int(math.log2(age_days + 1) * 1.5))
+    score = safety_points + size_points + age_points
+    if candidate.recommendation == "delete":
+        score += 8
+    elif candidate.recommendation == "keep":
+        score = min(score, 12)
+    elif candidate.safety == "review":
+        score = min(score, 50)
+    if candidate.requires_admin:
+        score -= 5
+    return max(0, min(100, score))
+
+
+def candidate_for(path: Path, scope: Path, spec: TargetSpec) -> Candidate:
+    size, modified, inaccessible = directory_size(path, path.name)
+    return Candidate(
+        id=uuid.uuid4().hex[:10],
+        path=str(path),
+        scope=str(scope),
+        label=f"{spec.label}: {path.name}",
+        group=spec.group,
+        safety=spec.safety,
+        reason=spec.reason,
+        bytes=size,
+        modified_at=modified,
+        inaccessible_entries=inaccessible,
+        requires_admin=spec.requires_admin,
+        mode=spec.mode,
+        recommendation="delete" if spec.safety in {"trash", "cache", "rotated_log"} else "review",
+    )
+
+
+def scan(home: Path, min_bytes: int) -> list[Candidate]:
+    candidates: list[Candidate] = []
+    specs = safe_roots(home)
+    console.info("Scanning only known cleanup areas — your documents and application bundles are excluded.")
+    for spec_index, spec in enumerate(specs, 1):
+        expanded = [Path(p) for p in glob.glob(os.path.expanduser(spec.pattern))]
+        if not expanded:
+            continue
+        for root in expanded:
+            if not root.exists() or root.is_symlink():
+                continue
+            console.info(f"[{spec_index}/{len(specs)}] Measuring {spec.label}: {root}")
+            if spec.mode == "rotated_logs":
+                paths = list(rotated_log_files(root))
+            elif spec.mode == "children":
+                try:
+                    with os.scandir(root) as entries:
+                        paths = [Path(entry.path) for entry in entries if not entry.is_symlink()]
+                except (OSError, PermissionError):
+                    console.warn(f"Cannot read {root}; skipped.")
+                    continue
+            else:
+                paths = [root]
+            for path in paths:
+                candidate = candidate_for(path, root, spec)
+                if candidate.bytes >= min_bytes:
+                    candidates.append(candidate)
+
+    for installer, spec in download_installers(home):
+        candidate = candidate_for(installer, Path(spec.pattern), spec)
+        if candidate.bytes >= min_bytes:
+            candidates.append(candidate)
+    for candidate in candidates:
+        candidate.priority = calculate_priority(candidate)
+    return sorted(candidates, key=lambda item: (item.priority, item.bytes), reverse=True)
+
+
+def cache_path(cache_dir: Path) -> Path:
+    return cache_dir / "scan.json"
+
+
+def load_cache(cache_dir: Path) -> Optional[dict]:
+    location = cache_path(cache_dir)
+    try:
+        with location.open(encoding="utf-8") as handle:
+            data = json.load(handle)
+        if data.get("version") != CACHE_VERSION:
+            return None
+        return data
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def write_cache(cache_dir: Path, home: Path, min_bytes: int, candidates: list[Candidate]) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    destination = cache_path(cache_dir)
+    temporary = destination.with_suffix(".json.tmp")
+    data = {
+        "version": CACHE_VERSION,
+        "scanned_at": time.time(),
+        "home": str(home),
+        "platform": platform.system(),
+        "min_bytes": min_bytes,
+        "items": [asdict(item) for item in candidates],
+    }
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+    os.replace(temporary, destination)
+
+
+def load_candidates(cache_dir: Path) -> tuple[Optional[dict], list[Candidate]]:
+    data = load_cache(cache_dir)
+    if not data:
+        return None, []
+    try:
+        return data, [Candidate.from_dict(value) for value in data["items"]]
+    except (KeyError, TypeError):
+        return None, []
+
+
+def disk_summary(home: Path) -> str:
+    home_usage = shutil.disk_usage(home)
+    root_usage = shutil.disk_usage("/")
+    home_text = f"Home volume free: {human_bytes(home_usage.free)} / {human_bytes(home_usage.total)}"
+    if home_usage.total != root_usage.total or home_usage.free != root_usage.free:
+        return home_text + f"  |  Root volume free: {human_bytes(root_usage.free)} / {human_bytes(root_usage.total)}"
+    return home_text
+
+
+def render_items(items: list[Candidate], home: Path, limit: Optional[int] = None) -> None:
+    shown = items[:limit] if limit else items
+    print()
+    print(disk_summary(home))
+    potential = sum(item.bytes for item in items if item.recommendation == "delete")
+    print(f"Recommended reclaim: {human_bytes(potential)}  •  {len(items)} candidate(s)")
+    print("#  Priority  Size       Recommendation  What can be cleaned")
+    print("-" * 92)
+    for index, item in enumerate(shown, 1):
+        recommendation = item.recommendation.upper()
+        if item.requires_admin:
+            recommendation += " (admin)"
+        print(f"{index:>2}  {item.priority:>3}/100  {human_bytes(item.bytes):>9}  {recommendation:<18}  {item.label}")
+        print(f"    {item.path}")
+        print(f"    Why: {item.ai_reason or item.reason}  •  Last changed: {human_time(item.modified_at)}")
+        if item.inaccessible_entries:
+            print(f"    Note: {item.inaccessible_entries} unreadable entry(s); estimate may be low.")
+    if limit and len(items) > limit:
+        print(f"… {len(items) - limit} more. Use `list all` to show every item.")
+    print()
+
+
+def claude_command() -> Optional[str]:
+    return shutil.which("claude")
+
+
+def extract_json(text: str) -> Optional[dict]:
+    try:
+        raw = json.loads(text)
+        if isinstance(raw, dict) and isinstance(raw.get("result"), str):
+            text = raw["result"]
+        elif isinstance(raw, dict) and "recommendation" in raw:
+            return raw
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{\s*\"recommendation\".*?\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def ask_claude(item: Candidate) -> tuple[Optional[str], str, Optional[float]]:
+    binary = claude_command()
+    if not binary:
+        return None, "Claude CLI (`claude`) was not found in PATH.", None
+    prompt = f"""You are reviewing one disk-cleanup candidate on {platform.system()}.
+Be conservative: do not recommend deletion when it may be user data or costly to restore.
+Return ONLY a JSON object with exactly recommendation, confidence, reason.
+recommendation must be one of delete, review, keep. confidence is 0 through 1.
+Keep reason under 140 characters. Metadata:
+path: {item.path}
+label: {item.label}
+category: {item.group}; baseline safety: {item.safety}
+size: {human_bytes(item.bytes)}; last modified: {human_time(item.modified_at)}
+known description: {item.reason}
+"""
+    try:
+        result = subprocess.run(
+            [binary, "-p", prompt, "--output-format", "json"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=90,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return None, f"Claude CLI did not finish: {error}", None
+    try:
+        raw_response = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raw_response = None
+    if isinstance(raw_response, dict) and raw_response.get("is_error"):
+        detail = str(raw_response.get("result") or raw_response.get("error") or "unknown Claude CLI error")
+        if "authenticate" in detail.lower() or "token has expired" in detail.lower() or "401" in detail:
+            return None, "Claude authentication expired. Run `claude auth login`, then press r to rescan.", None
+        return None, f"Claude CLI error: {detail[:220]}", None
+    if result.returncode != 0:
+        detail = result.stderr.strip().splitlines()[-1:] or ["unknown Claude CLI error"]
+        return None, f"Claude CLI failed: {detail[0]}", None
+    data = extract_json(result.stdout)
+    if not data:
+        return None, "Claude CLI returned no usable JSON assessment.", None
+    recommendation = str(data.get("recommendation", "review")).lower()
+    if recommendation not in {"delete", "review", "keep"}:
+        recommendation = "review"
+    try:
+        confidence = min(1.0, max(0.0, float(data.get("confidence"))))
+    except (TypeError, ValueError):
+        confidence = None
+    reason = str(data.get("reason", "No explanation supplied.")).strip().replace("\n", " ")[:280]
+    return recommendation, reason, confidence
+
+
+def assess_with_claude(
+    items: list[Candidate], only_ids: Optional[set[str]] = None, force: bool = False
+) -> tuple[int, list[str]]:
+    """Review large, uncertain candidates and return success count plus problems.
+
+    Automatic reviews skip a prior successful assessment. The manual `a` action
+    sets ``force`` to get a fresh opinion on the selected item.
+    """
+    if force:
+        # Manual review is an explicit user request.  Unlike automatic review,
+        # it can inspect the focused/selected cache or log item at any size.
+        relevant = [item for item in items if only_ids is None or item.id in only_ids]
+    else:
+        relevant = [
+            item
+            for item in items
+            if (
+                item.safety == "review"
+                and item.bytes >= AI_MIN_BYTES
+                and (only_ids is None or item.id in only_ids)
+                and not item.ai_reason.startswith("Claude:")
+            )
+        ]
+    if not relevant:
+        message = f"No unreviewed uncertain candidates at least {human_bytes(AI_MIN_BYTES)} need Claude."
+        console.info(message)
+        return 0, [message]
+    if not claude_command():
+        message = "Claude CLI is not available. Install/log in to Claude Code, then press r to rescan."
+        console.warn(message)
+        return 0, [message]
+    if force:
+        console.info(f"Sending metadata for {len(relevant)} user-selected candidate(s) to the signed-in Claude CLI.")
+    else:
+        console.info(f"Sending metadata for {len(relevant)} uncertain, large candidate(s) to the signed-in Claude CLI.")
+    reviewed = 0
+    problems: list[str] = []
+    for number, item in enumerate(relevant, 1):
+        console.info(f"AI review [{number}/{len(relevant)}]: {item.label} ({human_bytes(item.bytes)})")
+        recommendation, reason, confidence = ask_claude(item)
+        if recommendation:
+            # Claude's opinion influences ranking/explanation only.  It never
+            # removes the typed deletion confirmation or bypasses safe scopes.
+            item.recommendation = recommendation
+            item.ai_reason = f"Claude: {reason}"
+            item.ai_confidence = confidence
+            item.priority = calculate_priority(item)
+            console.good(f"Claude: {recommendation} ({confidence if confidence is not None else 'n/a'})")
+            reviewed += 1
+        else:
+            item.ai_reason = f"Claude unavailable: {reason}"
+            problems.append(reason)
+            console.warn(reason)
+    items.sort(key=lambda item: (item.priority, item.bytes), reverse=True)
+    return reviewed, problems
+
+
+def download_spec(home: Path) -> TargetSpec:
+    return TargetSpec(
+        str(home / "Downloads"),
+        "Old installer/archive",
+        "Review",
+        "review",
+        "Old installer or archive in Downloads; inspect before deletion",
+        "item",
+    )
+
+
+def current_allowed_scopes(home: Path) -> list[tuple[Path, TargetSpec]]:
+    scopes: list[tuple[Path, TargetSpec]] = []
+    for spec in safe_roots(home):
+        for value in glob.glob(os.path.expanduser(spec.pattern)):
+            candidate = Path(value)
+            if candidate.exists() and not candidate.is_symlink():
+                scopes.append((candidate.resolve(), spec))
+    downloads = home / "Downloads"
+    if downloads.is_dir() and not downloads.is_symlink():
+        scopes.append((downloads.resolve(), download_spec(home)))
+    return scopes
+
+
+def deletion_is_allowed(item: Candidate, home: Path) -> tuple[bool, str]:
+    path = Path(item.path)
+    try:
+        item_stat = path.lstat()
+    except FileNotFoundError:
+        return False, "already gone"
+    except OSError as error:
+        return False, str(error)
+    if stat.S_ISLNK(item_stat.st_mode):
+        return False, "refusing to delete a symlink"
+    resolved = path.resolve()
+    cached_scope = Path(item.scope).resolve(strict=False)
+    for scope, spec in current_allowed_scopes(home):
+        if cached_scope != scope or item.mode != spec.mode or item.safety != spec.safety:
+            continue
+        if not path_is_within(resolved, scope):
+            continue
+        if spec.mode == "rotated_logs" and not re.search(r"(?:\.gz|\.bz2|\.xz|\.zst|\.old|\.bak|\.\d+)$", path.name, re.IGNORECASE):
+            return False, "not a rotated log file"
+        if spec.mode == "item":
+            name = path.name.lower()
+            old_enough = time.time() - item_stat.st_mtime >= 30 * 86400
+            if not any(name.endswith(suffix) for suffix in INSTALLER_SUFFIXES) or not old_enough:
+                return False, "not an old installer/archive in Downloads"
+        return True, ""
+    return False, "not within a currently approved cleanup scope"
+
+
+def delete_item(item: Candidate, home: Path) -> tuple[bool, str]:
+    allowed, detail = deletion_is_allowed(item, home)
+    if not allowed:
+        return False, detail
+    path = Path(item.path)
+    try:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        return True, ""
+    except PermissionError:
+        return False, "permission denied (this item may require administrator rights)"
+    except OSError as error:
+        return False, str(error)
+
+
+def indexes_from_text(text: str, total: int) -> list[int]:
+    result: set[int] = set()
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            pieces = part.split("-", 1)
+            try:
+                start, end = int(pieces[0]), int(pieces[1])
+            except ValueError:
+                raise ValueError(f"Invalid range: {part}") from None
+            result.update(range(start, end + 1))
+        else:
+            try:
+                result.add(int(part))
+            except ValueError:
+                raise ValueError(f"Invalid number: {part}") from None
+    invalid = [number for number in result if number < 1 or number > total]
+    if invalid:
+        raise ValueError(f"No result numbered: {', '.join(map(str, sorted(invalid)))}")
+    return sorted(result)
+
+
+def delete_selection(items: list[Candidate], indexes: list[int], home: Path) -> list[Candidate]:
+    selected = [items[index - 1] for index in indexes]
+    reclaim = sum(item.bytes for item in selected)
+    print(f"Selected {len(selected)} item(s); estimated reclaim: {human_bytes(reclaim)}.")
+    for item in selected:
+        print(f"  #{items.index(item) + 1}: {item.path}")
+    print("Deletion is permanent. It cannot be undone by this tool.")
+    confirmation = input("Type DELETE to permanently remove the selected items: ").strip()
+    if confirmation != "DELETE":
+        console.info("Cancelled; nothing was deleted.")
+        return items
+    kept: list[Candidate] = []
+    for item in items:
+        if item not in selected:
+            kept.append(item)
+            continue
+        console.info(f"Deleting {item.path}")
+        success, detail = delete_item(item, home)
+        if success:
+            console.good(f"Removed {human_bytes(item.bytes)} estimated: {item.label}")
+        else:
+            console.warn(f"Skipped {item.label}: {detail}")
+            kept.append(item)
+    print(disk_summary(home))
+    return kept
+
+
+def scan_and_save(home: Path, cache_dir: Path, min_bytes: int, use_ai: bool) -> list[Candidate]:
+    started = time.monotonic()
+    results = scan(home, min_bytes)
+    if use_ai:
+        assess_with_claude(results)
+    write_cache(cache_dir, home, min_bytes, results)
+    console.good(f"Scan complete in {time.monotonic() - started:.1f}s; cached at {cache_path(cache_dir)}")
+    return results
+
+
+def plain_interactive(home: Path, cache_dir: Path, min_bytes: int, use_ai: bool) -> int:
+    data, items = load_candidates(cache_dir)
+    if data and data.get("home") == str(home):
+        timestamp = dt.datetime.fromtimestamp(data["scanned_at"]).strftime("%Y-%m-%d %H:%M")
+        console.info(f"Using cached scan from {timestamp}. Type `rescan` to measure again.")
+    else:
+        items = scan_and_save(home, cache_dir, min_bytes, use_ai)
+    render_items(items, home, limit=30)
+    print("Commands: list [all], rescan, ai N[,N], delete N[,N], quit")
+    while True:
+        try:
+            command = input("rm-rf> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if not command:
+            continue
+        name, _, argument = command.partition(" ")
+        name = name.lower()
+        try:
+            if name in {"quit", "q", "exit"}:
+                return 0
+            if name in {"list", "l"}:
+                render_items(items, home, None if argument.strip().lower() == "all" else 30)
+            elif name in {"rescan", "r", "reload"}:
+                items = scan_and_save(home, cache_dir, min_bytes, use_ai)
+                render_items(items, home, limit=30)
+            elif name == "ai":
+                indexes = indexes_from_text(argument, len(items))
+                assess_with_claude(items, {items[index - 1].id for index in indexes}, force=True)
+                write_cache(cache_dir, home, min_bytes, items)
+                render_items(items, home, limit=30)
+            elif name in {"delete", "d", "clean"}:
+                indexes = indexes_from_text(argument, len(items))
+                items = delete_selection(items, indexes, home)
+                write_cache(cache_dir, home, min_bytes, items)
+            elif name in {"help", "h", "?"}:
+                print("Use numbers from the current list: `delete 1,3-5`, `ai 2`, `list all`, or `rescan`.")
+            else:
+                console.warn("Unknown command. Type `help`.")
+        except ValueError as error:
+            console.warn(str(error))
+
+
+class RmRfTui:
+    """A keyboard-driven terminal UI with an installer-like visual hierarchy."""
+
+    def __init__(self, screen: "curses._CursesWindow", home: Path, cache_dir: Path, min_bytes: int, use_ai: bool) -> None:
+        self.screen = screen
+        self.home = home
+        self.cache_dir = cache_dir
+        self.min_bytes = min_bytes
+        self.use_ai = use_ai
+        self.items: list[Candidate] = []
+        self.selected: set[str] = set()
+        self.cursor = 0
+        self.status = "Preparing a very responsible `rm -rf` experience."
+        self.scanning = False
+        self.work_as_overlay = False
+        self.scanned_at: Optional[float] = None
+
+    def setup(self) -> None:
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        self.screen.keypad(True)
+        curses.start_color()
+        curses.use_default_colors()
+        # These are intentionally close to Ubuntu's plum/orange palette while
+        # still respecting the terminal's default background.
+        curses.init_pair(1, curses.COLOR_MAGENTA, -1)  # title
+        curses.init_pair(2, curses.COLOR_CYAN, -1)  # accent
+        curses.init_pair(3, curses.COLOR_GREEN, -1)  # safe/positive
+        curses.init_pair(4, curses.COLOR_YELLOW, -1)  # caution
+        curses.init_pair(5, curses.COLOR_WHITE, -1)  # foreground
+        curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_MAGENTA)  # selected row
+        curses.init_pair(10, curses.COLOR_BLACK, curses.COLOR_GREEN)  # persistent checked row
+        curses.init_pair(11, curses.COLOR_BLACK, curses.COLOR_CYAN)  # cursor on checked row
+        # Modal panels deliberately use a solid high-contrast background.  A
+        # transparent terminal overlay makes detailed safety reasons unreadable.
+        curses.init_pair(7, curses.COLOR_BLACK, curses.COLOR_WHITE)  # modal body
+        curses.init_pair(8, curses.COLOR_WHITE, curses.COLOR_MAGENTA)  # modal heading
+        curses.init_pair(9, curses.COLOR_RED, curses.COLOR_WHITE)  # modal warning/input
+
+    def attr(self, name: str) -> int:
+        return {
+            "title": curses.color_pair(1) | curses.A_BOLD,
+            "accent": curses.color_pair(2) | curses.A_BOLD,
+            "good": curses.color_pair(3) | curses.A_BOLD,
+            "warn": curses.color_pair(4) | curses.A_BOLD,
+            "text": curses.color_pair(5),
+            "selected": curses.color_pair(6) | curses.A_BOLD,
+            "marked": curses.color_pair(10) | curses.A_BOLD,
+            "marked_current": curses.color_pair(11) | curses.A_BOLD,
+            "dim": curses.A_DIM,
+            "modal": curses.color_pair(7),
+            "modal_title": curses.color_pair(8) | curses.A_BOLD,
+            "modal_warn": curses.color_pair(9) | curses.A_BOLD,
+        }[name]
+
+    def add(self, y: int, x: int, text: str, style: int = 0, width: Optional[int] = None) -> None:
+        height, screen_width = self.screen.getmaxyx()
+        if y < 0 or y >= height or x >= screen_width:
+            return
+        available = max(0, screen_width - x)
+        if width is not None:
+            available = min(available, max(0, width))
+        if available <= 0:
+            return
+        try:
+            self.screen.addnstr(y, x, text, available, style)
+        except curses.error:
+            pass
+
+    def box(self, y: int, x: int, height: int, width: int, title: str = "") -> None:
+        if height < 3 or width < 4:
+            return
+        horizontal = "─" * max(0, width - 2)
+        self.add(y, x, "╭" + horizontal + "╮", self.attr("dim"), width)
+        for row in range(y + 1, y + height - 1):
+            self.add(row, x, "│", self.attr("dim"))
+            self.add(row, x + width - 1, "│", self.attr("dim"))
+        self.add(y + height - 1, x, "╰" + horizontal + "╯", self.attr("dim"), width)
+        if title:
+            self.add(y, x + 2, f" {title} ", self.attr("accent"), width - 4)
+
+    def message_screen(self, heading: str, text: str) -> None:
+        self.screen.erase()
+        height, width = self.screen.getmaxyx()
+        panel_width = min(max(56, width - 12), 90)
+        panel_height = 9
+        y = max(1, (height - panel_height) // 2)
+        x = max(2, (width - panel_width) // 2)
+        self.box(y, x, panel_height, panel_width, APP_NAME)
+        self.add(y + 2, x + 3, heading, self.attr("title"), panel_width - 6)
+        self.add(y + 4, x + 3, text, self.attr("text"), panel_width - 6)
+        self.add(y + 6, x + 3, "Your files are safe; only known cleanup locations are being checked.", self.attr("dim"), panel_width - 6)
+        self.screen.refresh()
+
+    def work_overlay(self, heading: str, text: str) -> None:
+        """Show work progress in a small panel without hiding the result list."""
+        self.draw()
+        height, width = self.screen.getmaxyx()
+        panel_width = min(max(52, width - 20), 82)
+        panel_height = 7
+        y = max(1, (height - panel_height) // 2)
+        x = max(2, (width - panel_width) // 2)
+        for row in range(y, y + panel_height):
+            self.add(row, x, " " * panel_width, self.attr("modal"), panel_width)
+        horizontal = "─" * max(0, panel_width - 2)
+        self.add(y, x, "╭" + horizontal + "╮", self.attr("modal_title"), panel_width)
+        for row in range(y + 1, y + panel_height - 1):
+            self.add(row, x, "│", self.attr("modal_title"))
+            self.add(row, x + panel_width - 1, "│", self.attr("modal_title"))
+        self.add(y + panel_height - 1, x, "╰" + horizontal + "╯", self.attr("modal_title"), panel_width)
+        self.add(y, x + 2, f" {heading} ", self.attr("modal_title"), panel_width - 4)
+        self.add(y + 2, x + 3, text, self.attr("modal"), panel_width - 6)
+        self.add(y + 4, x + 3, "The list remains behind this panel. rm-rf is thinking politely.", self.attr("modal"), panel_width - 6)
+        self.screen.refresh()
+
+    def scan_notice(self, level: str, text: str) -> None:
+        self.status = text
+        heading = "Asking Claude politely…" if "Claude" in text or "AI review" in text or "metadata" in text else "Looking for digital lint…"
+        if self.work_as_overlay:
+            self.work_overlay(heading, text)
+        else:
+            self.message_screen(heading, text)
+
+    def card(self, y: int, x: int, width: int, title: str, main: str, hint: str, tone: str = "text") -> None:
+        self.box(y, x, 5, width, title)
+        self.add(y + 1, x + 2, main, self.attr(tone), width - 4)
+        self.add(y + 3, x + 2, hint, self.attr("dim"), width - 4)
+
+    def active_item(self) -> Optional[Candidate]:
+        if not self.items:
+            return None
+        self.cursor = max(0, min(self.cursor, len(self.items) - 1))
+        return self.items[self.cursor]
+
+    def selected_items(self) -> list[Candidate]:
+        return [item for item in self.items if item.id in self.selected]
+
+    def draw_detail(self, y: int, x: int, height: int, width: int, item: Candidate) -> None:
+        self.box(y, x, height, width, "Selected candidate")
+        self.add(y + 1, x + 2, item.label, self.attr("accent"), width - 4)
+        fields = [
+            f"{human_bytes(item.bytes)}  •  priority {item.priority}/100",
+            f"{item.recommendation.upper()}  •  {item.group}",
+            item.path,
+            item.ai_reason or item.reason,
+            f"Changed {human_time(item.modified_at)}",
+        ]
+        row = y + 3
+        for field in fields:
+            if row >= y + height - 1:
+                break
+            self.add(row, x + 2, field, self.attr("text") if row != y + 5 else self.attr("dim"), width - 4)
+            row += 2 if row == y + 3 else 1
+
+    def draw(self) -> None:
+        self.screen.erase()
+        height, width = self.screen.getmaxyx()
+        if height < 18 or width < 72:
+            self.add(2, 2, "rm-rf needs a terminal at least 72 columns × 18 rows.", self.attr("warn"))
+            self.add(4, 2, "Resize the terminal, then press any key.", self.attr("text"))
+            self.screen.refresh()
+            return
+
+        self.add(1, 3, "rm-rf", self.attr("title"))
+        self.add(1, 10, "the disk cleaner with a name your sysadmin would side-eye", self.attr("dim"), width - 13)
+        self.add(2, 3, self.status, self.attr("text"), width - 6)
+
+        usage = shutil.disk_usage(self.home)
+        selected = self.selected_items()
+        selected_bytes = sum(item.bytes for item in selected)
+        recommended = sum(item.bytes for item in self.items if item.recommendation == "delete")
+        gap = 2
+        card_width = max(20, (width - 8 - gap * 2) // 3)
+        self.card(4, 3, card_width, "SPACE AVAILABLE", human_bytes(usage.free), f"of {human_bytes(usage.total)} on this volume", "good")
+        self.card(4, 3 + card_width + gap, card_width, "RECOMMENDED RECLAIM", human_bytes(recommended), "high-confidence items only", "accent")
+        self.card(4, 3 + (card_width + gap) * 2, card_width, "YOUR SELECTION", human_bytes(selected_bytes), f"{len(selected)} item(s) ready to review", "warn" if selected else "text")
+
+        list_y = 10
+        footer_y = height - 3
+        wide = width >= 118
+        list_width = int((width - 8) * 0.62) if wide else width - 6
+        list_height = max(5, footer_y - list_y)
+        self.box(list_y, 3, list_height, list_width, f"Cleanup candidates · {len(self.items)} found")
+        self.add(list_y + 1, 5, "   STATE          PRIORITY     SIZE     RECOMMENDATION     ITEM", self.attr("dim"), list_width - 4)
+        visible = max(1, list_height - 3)
+        start = max(0, min(self.cursor - visible // 2, max(0, len(self.items) - visible)))
+        for row, item in enumerate(self.items[start : start + visible], list_y + 2):
+            index = start + (row - (list_y + 2))
+            marked = item.id in self.selected
+            # Keep this field fixed-width so selecting a row never shifts its
+            # priority, size, recommendation, or label columns.
+            checked = f"{'[✓ SELECTED]' if marked else '[ ]':<13}"
+            marker = "›" if index == self.cursor else " "
+            rec = item.recommendation.upper()
+            line = f"{marker}{checked}  {item.priority:>3}/100  {human_bytes(item.bytes):>9}  {rec:<14} {item.label}"
+            if marked and index == self.cursor:
+                style = self.attr("marked_current")
+            elif marked:
+                style = self.attr("marked")
+            elif index == self.cursor:
+                style = self.attr("selected")
+            else:
+                style = self.attr("text")
+            self.add(row, 5, line, style, list_width - 4)
+        if not self.items:
+            self.add(list_y + 3, 5, "Nothing above the current minimum size. Your disk is suspiciously well behaved.", self.attr("dim"), list_width - 4)
+
+        active = self.active_item()
+        if wide and active:
+            detail_x = 3 + list_width + 2
+            self.draw_detail(list_y, detail_x, list_height, width - detail_x - 3, active)
+        elif active:
+            self.add(footer_y - 1, 3, f"{active.path}  •  press i for details", self.attr("dim"), width - 6)
+
+        footer = "↑↓ move   Space select/unselect   green [✓ SELECTED] = deletion set   Enter delete   i details   a review focused item   r rescan   q quit"
+        self.add(height - 2, 3, footer, self.attr("dim"), width - 6)
+        self.screen.refresh()
+
+    def read_text(self, title: str, lines: list[str], prompt: str) -> str:
+        height, width = self.screen.getmaxyx()
+        panel_width = min(max(56, width - 12), 96)
+        content_width = max(16, panel_width - 6)
+        wrapped_lines: list[str] = []
+        for line in lines:
+            wrapped_lines.extend(
+                textwrap.wrap(line, width=content_width, break_long_words=True, break_on_hyphens=False) or [""]
+            )
+        maximum_body_rows = max(1, height - 9)
+        if len(wrapped_lines) > maximum_body_rows:
+            wrapped_lines = wrapped_lines[:maximum_body_rows]
+            wrapped_lines[-1] = "…"
+        panel_height = min(height - 4, max(9, len(wrapped_lines) + 6))
+        y = max(1, (height - panel_height) // 2)
+        x = max(2, (width - panel_width) // 2)
+
+        # Paint every cell, then draw the panel with modal-specific attributes.
+        # This is intentionally not a transparent curses overlay.
+        for row in range(y, y + panel_height):
+            self.add(row, x, " " * panel_width, self.attr("modal"), panel_width)
+        horizontal = "─" * max(0, panel_width - 2)
+        self.add(y, x, "╭" + horizontal + "╮", self.attr("modal_title"), panel_width)
+        for row in range(y + 1, y + panel_height - 1):
+            self.add(row, x, "│", self.attr("modal_title"))
+            self.add(row, x + panel_width - 1, "│", self.attr("modal_title"))
+        self.add(y + panel_height - 1, x, "╰" + horizontal + "╯", self.attr("modal_title"), panel_width)
+        self.add(y, x + 2, f" {title} ", self.attr("modal_title"), panel_width - 4)
+        for index, line in enumerate(wrapped_lines):
+            self.add(y + 2 + index, x + 3, line, self.attr("modal"), panel_width - 6)
+        input_y = y + panel_height - 3
+        if not prompt:
+            self.add(input_y, x + 3, "Press any key to return.", self.attr("modal"), panel_width - 6)
+            self.screen.refresh()
+            self.screen.getch()
+            return ""
+        self.add(input_y, x + 3, prompt, self.attr("modal_warn"), panel_width - 6)
+        input_x = min(x + 3 + len(prompt), x + panel_width - 6)
+        try:
+            try:
+                curses.curs_set(1)
+            except curses.error:
+                pass
+            curses.echo()
+            self.screen.attrset(self.attr("modal"))
+            self.screen.move(input_y, input_x)
+            response = self.screen.getstr(input_y, input_x, max(1, panel_width - (input_x - x) - 4)).decode(errors="replace")
+        finally:
+            curses.noecho()
+            self.screen.attrset(0)
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+        return response.strip()
+
+    def show_detail(self) -> None:
+        item = self.active_item()
+        if not item:
+            return
+        lines = [
+            item.label,
+            f"Path: {item.path}",
+            f"What: {item_identity(item)}",
+            f"Safety: {safety_summary(item)}",
+            f"Size: {human_bytes(item.bytes)} · priority: {item.priority}/100 · changed: {human_time(item.modified_at)}",
+            f"Recommendation: {item.recommendation.upper()}",
+            f"Cleanup rationale: {item.ai_reason or item.reason}",
+        ]
+        self.read_text("Candidate details", lines, "")
+
+    def run_work(self, message: str, operation: Callable[[], None], overlay: bool = False) -> None:
+        prior_handler = console.handler
+        self.scanning = "Scanning" in message
+        self.work_as_overlay = overlay
+        self.status = message
+        console.handler = self.scan_notice
+        try:
+            self.scan_notice("info", message)
+            operation()
+        finally:
+            console.handler = prior_handler
+            self.scanning = False
+            self.work_as_overlay = False
+
+    def refresh_scan(self) -> None:
+        def operation() -> None:
+            self.items = scan_and_save(self.home, self.cache_dir, self.min_bytes, self.use_ai)
+
+        self.run_work("Scanning bounded cleanup locations…", operation)
+        data = load_cache(self.cache_dir)
+        self.scanned_at = data.get("scanned_at") if data else time.time()
+        self.selected.clear()
+        self.cursor = 0
+        reviewed = sum(1 for item in self.items if item.ai_reason.startswith("Claude:"))
+        unavailable = [item.ai_reason.removeprefix("Claude unavailable: ") for item in self.items if item.ai_reason.startswith("Claude unavailable:")]
+        if reviewed:
+            self.status = f"Fresh scan complete. Claude reviewed {reviewed} uncertain large item(s); reasons are in the detail panel."
+        elif unavailable:
+            self.status = unavailable[-1]
+            self.read_text(
+                "Claude sign-in required",
+                [
+                    self.status,
+                    "Run `claude auth login` in a terminal and complete sign-in.",
+                    "Then return here and press r to rerun the scan and automatic review.",
+                ],
+                "",
+            )
+        else:
+            self.status = f"Fresh scan complete. {len(self.items)} candidates are ready for a second opinion."
+
+    def review_with_claude(self) -> None:
+        focused = self.active_item()
+        if not focused:
+            return
+
+        outcome: dict[str, object] = {"reviewed": 0, "problems": []}
+
+        def operation() -> None:
+            reviewed, problems = assess_with_claude(self.items, {focused.id}, force=True)
+            outcome["reviewed"] = reviewed
+            outcome["problems"] = problems
+            write_cache(self.cache_dir, self.home, self.min_bytes, self.items)
+
+        self.run_work("Claude is considering the focused item…", operation, overlay=True)
+        if outcome["reviewed"]:
+            self.cursor = next((index for index, item in enumerate(self.items) if item.id == focused.id), self.cursor)
+            confidence = f"{focused.ai_confidence:.0%}" if focused.ai_confidence is not None else "not supplied"
+            self.status = "Claude's verdict was saved to this item."
+            self.read_text(
+                "Claude's verdict",
+                [
+                    focused.label,
+                    f"What: {item_identity(focused)}",
+                    f"Safety: {safety_summary(focused)}",
+                    f"Recommendation: {focused.recommendation.upper()}  ·  confidence: {confidence}",
+                    f"Claude rationale: {focused.ai_reason.removeprefix('Claude: ')}",
+                    "Saved to this item and reflected in its priority. Press any key to continue.",
+                ],
+                "",
+            )
+        else:
+            problems = outcome["problems"]
+            self.status = problems[-1] if problems else "Claude found nothing eligible to review."
+            self.read_text(
+                "Claude review needs attention",
+                [
+                    self.status,
+                    "To restore Claude review, run `claude auth login` in a terminal.",
+                    "After signing in, press r for automatic review or a for this item again.",
+                ],
+                "",
+            )
+
+    def delete_selected(self) -> None:
+        chosen = self.selected_items()
+        if not chosen and self.active_item():
+            chosen = [self.active_item()]
+        if not chosen:
+            return
+        reclaim = sum(item.bytes for item in chosen)
+        answer = self.read_text(
+            "Permanent deletion",
+            [
+                f"{len(chosen)} item(s), estimated reclaim: {human_bytes(reclaim)}.",
+                "rm-rf is wearing safety goggles, but this cannot be undone.",
+                "The selected paths remain constrained to approved cleanup scopes.",
+            ],
+            "Type DELETE: ",
+        )
+        if answer != "DELETE":
+            self.status = "Deletion cancelled. The disk breathes a sigh of relief."
+            return
+        kept: list[Candidate] = []
+        failed = 0
+        for item in self.items:
+            if item not in chosen:
+                kept.append(item)
+                continue
+            self.message_screen("Removing only what you approved…", item.label)
+            success, detail = delete_item(item, self.home)
+            if not success:
+                failed += 1
+                kept.append(item)
+                self.status = f"Skipped {item.label}: {detail}"
+        self.items = kept
+        self.selected.difference_update({item.id for item in chosen})
+        self.cursor = min(self.cursor, max(0, len(self.items) - 1))
+        write_cache(self.cache_dir, self.home, self.min_bytes, self.items)
+        removed = len(chosen) - failed
+        self.status = f"Removed {removed} item(s), estimated {human_bytes(reclaim)} reclaimed." if not failed else f"Removed {removed}; {failed} item(s) were safely skipped."
+
+    def load_initial_state(self) -> None:
+        data, items = load_candidates(self.cache_dir)
+        if data and data.get("home") == str(self.home):
+            self.items = items
+            self.scanned_at = data.get("scanned_at")
+            stamp = dt.datetime.fromtimestamp(self.scanned_at).strftime("%Y-%m-%d %H:%M") if self.scanned_at else "earlier"
+            self.status = f"Cached scan from {stamp}. Press r only when you want fresh measurements."
+        else:
+            self.refresh_scan()
+
+    def run(self) -> int:
+        self.setup()
+        self.load_initial_state()
+        while True:
+            self.draw()
+            key = self.screen.getch()
+            if key in (ord("q"), ord("Q"), 27):
+                return 0
+            if key in (curses.KEY_UP, ord("k")):
+                self.cursor = max(0, self.cursor - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.cursor = min(max(0, len(self.items) - 1), self.cursor + 1)
+            elif key == ord(" ") and self.active_item():
+                item = self.active_item()
+                if item.id in self.selected:
+                    self.selected.remove(item.id)
+                else:
+                    self.selected.add(item.id)
+            elif key in (10, 13, curses.KEY_ENTER, ord("d"), ord("D")):
+                self.delete_selected()
+            elif key in (ord("r"), ord("R")):
+                self.refresh_scan()
+            elif key in (ord("a"), ord("A")):
+                self.review_with_claude()
+            elif key in (ord("i"), ord("I")):
+                self.show_detail()
+
+
+def interactive(home: Path, cache_dir: Path, min_bytes: int, use_ai: bool, plain: bool = False) -> int:
+    if plain or not sys.stdin.isatty() or not sys.stdout.isatty():
+        return plain_interactive(home, cache_dir, min_bytes, use_ai)
+    try:
+        return curses.wrapper(lambda screen: RmRfTui(screen, home, cache_dir, min_bytes, use_ai).run())
+    except curses.error as error:
+        console.warn(f"Terminal UI could not start ({error}); using plain console mode.")
+        return plain_interactive(home, cache_dir, min_bytes, use_ai)
+
+
+def parser() -> argparse.ArgumentParser:
+    argument_parser = argparse.ArgumentParser(
+        prog=APP_NAME,
+        description="rm-rf: a conservative macOS/Ubuntu disk cleanup terminal UI. Scan results are cached until rescan.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    argument_parser.add_argument("command", nargs="?", choices=("interactive", "scan", "list"), default="interactive")
+    ai_options = argument_parser.add_mutually_exclusive_group()
+    ai_options.add_argument("--ai", dest="ai", action="store_true", default=True, help="Enable automatic Claude review (this is the default)")
+    ai_options.add_argument("--no-ai", dest="ai", action="store_false", default=argparse.SUPPRESS, help="Skip Claude review and keep uncertain items as REVIEW")
+    argument_parser.add_argument("--plain", action="store_true", help="Use the simple line-based console instead of the full-screen terminal UI")
+    argument_parser.add_argument("--min-size", type=float, default=50, metavar="MIB", help="Hide candidates smaller than this size")
+    argument_parser.add_argument("--cache-dir", type=Path, default=Path.home() / ".cache" / "rm-rf", help="Where scan results are stored")
+    return argument_parser
+
+
+def main() -> int:
+    args = parser().parse_args()
+    if args.min_size < 0:
+        parser().error("--min-size must be zero or greater")
+    home = Path.home().resolve()
+    cache_dir = args.cache_dir.expanduser().resolve()
+    min_bytes = int(args.min_size * MIB)
+    try:
+        if args.command == "interactive":
+            return interactive(home, cache_dir, min_bytes, args.ai, args.plain)
+        if args.command == "scan":
+            items = scan_and_save(home, cache_dir, min_bytes, args.ai)
+            render_items(items, home)
+            return 0
+        data, items = load_candidates(cache_dir)
+        if not data:
+            console.error("No cached scan. Run `rm-rf scan` first.")
+            return 2
+        render_items(items, home)
+        return 0
+    except RuntimeError as error:
+        console.error(str(error))
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
